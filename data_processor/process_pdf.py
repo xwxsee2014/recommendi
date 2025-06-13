@@ -5,6 +5,9 @@ from magic_pdf.data.data_reader_writer import FileBasedDataWriter, FileBasedData
 from magic_pdf.data.dataset import PymuDocDataset
 from magic_pdf.model.doc_analyze_by_custom_model import doc_analyze
 from magic_pdf.config.enums import SupportedPdfParseMethod
+from sqlalchemy import create_engine, Column, String, Integer, func
+from sqlalchemy.orm import declarative_base, sessionmaker
+from data_processor.smartcn_resource_download import ResourceDownloadStatus
 
 CLASSIFIED_JSON = os.path.join("temp_output", "k12", "classified_result.json")
 INPUT_BASE = os.path.join("temp_input", "k12", "download_files")
@@ -74,6 +77,59 @@ def traverse_and_process():
                     if os.path.exists(pdf_path):
                         process_pdf(pdf_path, output_dir, "lesson_slide")
     walk(data)
+
+# ==== 以下为从 smartcn_resource_download.py 移植的相关代码 ====
+Base = declarative_base()
+
+class ResourceProcessStatus(Base):
+    __tablename__ = 'resource_process_status'
+    course_bag_id = Column(String, primary_key=True)
+    textbook_id = Column(String)
+    lesson_plan = Column(Integer, default=0)
+    video = Column(Integer, default=0)
+    slides = Column(Integer, default=0)
+    learning_task = Column(Integer, default=0)
+    worksheet = Column(Integer, default=0)
+
+def init_db(db_path):
+    engine = create_engine(f'sqlite:///{db_path}')
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    return Session
+
+def get_unprocessed_lesson_plan_rows():
+    """
+    获取所有resource_download_status中lesson_plan>0的行，且resource_process_status中course_bag_id相同且lesson_plan<resource_download_status.lesson_plan的数据
+    返回列表，每项为dict，包含course_bag_id, textbook_id, lesson_plan_downloaded, lesson_plan_processed
+    """
+    output_dir = os.path.join(os.path.dirname(__file__), '../temp_output/smartcn')
+    db_path = os.path.join(output_dir, 'textbooks.db')
+    Session = init_db(db_path)
+    session = Session()
+    from sqlalchemy.orm import aliased
+    RPS = aliased(ResourceProcessStatus)
+    RDS = aliased(ResourceDownloadStatus)
+    q = session.query(
+        RDS.course_bag_id,
+        RDS.textbook_id,
+        RDS.lesson_plan.label('lesson_plan_downloaded'),
+        func.coalesce(RPS.lesson_plan, 0).label('lesson_plan_processed')
+    ).outerjoin(
+        RPS, RDS.course_bag_id == RPS.course_bag_id
+    ).filter(
+        RDS.lesson_plan > 0,
+        func.coalesce(RPS.lesson_plan, 0) < RDS.lesson_plan
+    )
+    result = []
+    for row in q.all():
+        result.append({
+            "course_bag_id": row.course_bag_id,
+            "textbook_id": row.textbook_id,
+            "lesson_plan_downloaded": row.lesson_plan_downloaded,
+            "lesson_plan_processed": row.lesson_plan_processed
+        })
+    session.close()
+    return result
 
 if __name__ == "__main__":
     # traverse_and_process()

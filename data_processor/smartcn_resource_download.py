@@ -24,7 +24,7 @@ class ResourceDownloadStatus(Base):
     __tablename__ = 'resource_download_status'
     course_bag_id = Column(String, primary_key=True)
     textbook_id = Column(String)
-    lesson_plan = Column(Integer, default=0)  # 1=已下载, 0=未下载
+    lesson_plan = Column(Integer, default=0)  # 0=未下载，>0=已下载数量
     video = Column(Integer, default=0)
     slides = Column(Integer, default=0)
     learning_task = Column(Integer, default=0)
@@ -256,7 +256,4 @@ def fetch_lesson_plan_resources_for_random_subjects():
 
 if __name__ == "__main__":
     # process_textbooks()
-    fetch_lesson_plan_resources_for_random_subjects()
-    # process_textbooks()
-    fetch_lesson_plan_resources_for_random_subjects()
     fetch_lesson_plan_resources_for_random_subjects()
