@@ -1,0 +1,1 @@
+docker run -p 6333:6333 -p 6334:6334 -v /home/xwxsee/qdrant/data:/qdrant/storage -v /home/xwxsee/qdrant/snapshots:/qdrant/snapshots -v /home/xwxsee/qdrant/config.yaml:/qdrant/config/production.yaml --name qdrant -d qdrant/qdrant:v1.14.1-gpu-nvidia
