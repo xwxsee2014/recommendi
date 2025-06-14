@@ -7,7 +7,7 @@ from magic_pdf.model.doc_analyze_by_custom_model import doc_analyze
 from magic_pdf.config.enums import SupportedPdfParseMethod
 from sqlalchemy import create_engine, Column, String, Integer, func
 from sqlalchemy.orm import declarative_base, sessionmaker, aliased
-from smartcn_resource_download import ResourceDownloadStatus
+from data_processor.smartcn_resource_download import ResourceDownloadStatus
 
 CLASSIFIED_JSON = os.path.join("temp_output", "k12", "classified_result.json")
 INPUT_BASE = os.path.join("temp_input", "k12", "download_files")
