@@ -7,7 +7,7 @@ from magic_pdf.model.doc_analyze_by_custom_model import doc_analyze
 from magic_pdf.config.enums import SupportedPdfParseMethod
 from sqlalchemy import create_engine, Column, String, Integer, func
 from sqlalchemy.orm import declarative_base, sessionmaker, aliased
-from data_processor.smartcn_resource_download import ResourceDownloadStatus
+from smartcn_resource_download import ResourceDownloadStatus
 
 CLASSIFIED_JSON = os.path.join("temp_output", "k12", "classified_result.json")
 INPUT_BASE = os.path.join("temp_input", "k12", "download_files")
@@ -90,6 +90,19 @@ class ResourceProcessStatus(Base):
     slides = Column(Integer, default=0)
     learning_task = Column(Integer, default=0)
     worksheet = Column(Integer, default=0)
+
+    @staticmethod
+    def get_all_course_bag_ids():
+        """
+        获取所有已存在的 course_bag_id
+        """
+        output_dir = os.path.join(os.path.dirname(__file__), '../temp_output/smartcn')
+        db_path = os.path.join(output_dir, 'textbooks.db')
+        Session = init_db(db_path)
+        session = Session()
+        ids = [row.course_bag_id for row in session.query(ResourceProcessStatus.course_bag_id).all()]
+        session.close()
+        return ids
 
 def init_db(db_path):
     engine = create_engine(f'sqlite:///{db_path}')

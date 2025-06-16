@@ -30,6 +30,14 @@ class ResourceDownloadStatus(Base):
     learning_task = Column(Integer, default=0)
     worksheet = Column(Integer, default=0)
 
+class NoLessonPlanResource(Base):
+    __tablename__ = 'no_lesson_plan_resource'
+    course_bag_id = Column(String, primary_key=True)
+
+class NoLessonPlanTextbook(Base):
+    __tablename__ = 'no_lesson_plan_textbook'
+    textbook_id = Column(String, primary_key=True)
+
 def init_db(db_path):
     engine = create_engine(f'sqlite:///{db_path}')
     Base.metadata.create_all(engine)
@@ -37,11 +45,11 @@ def init_db(db_path):
     return Session
 
 # 全局 x-nd-auth header
-X_ND_AUTH = 'MAC id="7F938B205F876FC3A30551F3A49313836755C0D451C08FC17466435A155BBD9BCFBFF3776F22B0460E3F711306236F1764324EB8AA1C4A9D",nonce="1749809443803:TJ647GFB",mac="/7UN506SW+juOhbU95YxF2zQAH68U2sewTi35j22lMY="'
+X_ND_AUTH = 'MAC id="7F938B205F876FC3A30551F3A49313836755C0D451C08FC17466435A155BBD9BCFBFF3776F22B0460E3F711306236F1764324EB8AA1C4A9D",nonce="1749979561001:W6SL8O8F",mac="SO377Mrz6MGcr0AkO0SWbTgLbo9xLq3Q6xvtpCEmmDQ="'
 
 # 全局资源数量上限
 data_num_threshold = {
-    "lesson_plan": 100
+    "lesson_plan": 500
 }
 
 def process_textbooks():
@@ -71,13 +79,31 @@ def process_textbooks():
     session.commit()
     session.close()
 
-def process_lesson_plan_detail(detail_json, course_bag_id, textbook_id, session):
-    print(f"Fetched lesson plan detail for {course_bag_id}")
-    # 检查是否已下载过
-    status = session.query(ResourceDownloadStatus).filter(ResourceDownloadStatus.course_bag_id == course_bag_id).first()
-    if status and status.lesson_plan:
+def detail_download_pre_check(course_bag_id, session, check_types):
+    """
+    检查指定course_bag_id的各资源类型是否都应跳过下载。
+    返回: skip_download(bool), skip_map(dict)，如 skip_map={"lesson_plan": True/False, ...}
+    """
+    skip_map = {}
+    for rtype in check_types:
+        if rtype == 'lesson_plan':
+            no_lp = session.query(NoLessonPlanResource).filter(NoLessonPlanResource.course_bag_id == course_bag_id).first()
+            status = session.query(ResourceDownloadStatus).filter(ResourceDownloadStatus.course_bag_id == course_bag_id).first()
+            if no_lp or (status and status.lesson_plan and status.lesson_plan > 0):
+                skip_map['lesson_plan'] = True
+            else:
+                skip_map['lesson_plan'] = False
+        else:
+            skip_map[rtype] = True
+    skip_download = all(skip_map.values())
+    return skip_download, skip_map
+
+def process_lesson_plan_detail(detail_json, course_bag_id, textbook_id, session, skip_map=None):
+    if skip_map is not None and skip_map.get("lesson_plan", False):
+        print(f"The lesson plan for {course_bag_id} has already been processed, skipping...")
         return
     # relations下所有list类型value平铺为resource_list
+    print(f"Fetched lesson plan detail for {course_bag_id}")
     relations = detail_json.get('relations', {})
     resource_list = []
     for v in relations.values():
@@ -90,6 +116,7 @@ def process_lesson_plan_detail(detail_json, course_bag_id, textbook_id, session)
     resource_tags = []
     lesson_plan_downloaded_count = 0
     pdf_index = 1  # 用于命名pdf文件的序号
+    has_jiaoxuesheji_tag = False
     for res in resource_list:
         tag_list = res.get('tag_list', [])
         # 收集所有tag_name
@@ -100,9 +127,10 @@ def process_lesson_plan_detail(detail_json, course_bag_id, textbook_id, session)
         # 判断是否有tag_name为"教学设计"
         has_jiaoxuesheji = any(tag.get('tag_name') == '教学设计' for tag in tag_list)
         if has_jiaoxuesheji:
+            has_jiaoxuesheji_tag = True
             ti_items = res.get('ti_items', [])
             for ti_item in ti_items:
-                if ti_item.get('ti_file_flag') == 'pdf':
+                if ti_item.get('ti_file_flag') == 'pdf' or ti_item.get('ti_format') == 'pdf':
                     ti_storages = ti_item.get('ti_storages', [])
                     for storage in ti_storages:
                         if isinstance(storage, str):
@@ -139,6 +167,13 @@ def process_lesson_plan_detail(detail_json, course_bag_id, textbook_id, session)
                             print(f"Failed to download PDF from {pdf_url}: {e}")
                     # 不break，继续下一个ti_item
     print(f"Resource tag names found: {', '.join(set(resource_tags))}")
+    # 若没有"教学设计"tag，插入no_lesson_plan_resource表
+    if not has_jiaoxuesheji_tag:
+        if not session.query(NoLessonPlanResource).filter_by(course_bag_id=course_bag_id).first():
+            session.add(NoLessonPlanResource(course_bag_id=course_bag_id))
+            session.commit()
+        print(f"该资源没有lesson plan，skipping: {course_bag_id}")
+        return
     # 更新数据库
     if lesson_plan_downloaded_count > 0:
         tb = session.query(Textbook).filter(Textbook.id == textbook_id).first()
@@ -161,26 +196,18 @@ def process_lesson_plan_detail(detail_json, course_bag_id, textbook_id, session)
             exit(0)
 
 def fetch_lesson_plan_resources_for_random_subjects():
-    # 支持的学科关键词
-    subjects = ['语文', '数学', '英语', '物理', '化学', '生物', '历史', '地理', '政治', '科学', '信息', '音乐', '美术', '体育']
     output_dir = os.path.join(os.path.dirname(__file__), '../temp_output/smartcn')
     db_path = os.path.join(output_dir, 'textbooks.db')
     Session = init_db(db_path)
     session = Session()
 
-    # 查询符合条件的 textbook
-    textbooks = session.query(Textbook).filter(Textbook.downloaded_lesson_plan_num < 10).all()
-    # 按学科分组
-    subject_textbook_map = {}
-    for subj in subjects:
-        for tb in textbooks:
-            if subj in tb.title and subj not in subject_textbook_map:
-                subject_textbook_map[subj] = tb
-                break
-    # 随机选10个不同学科
-    selected = list(subject_textbook_map.values())
-    if len(selected) > 10:
-        selected = random.sample(selected, 10)
+    # 查询不在no_lesson_plan_textbook中的 textbook
+    no_lp_tb_ids = set([row.textbook_id for row in session.query(NoLessonPlanTextbook).all()])
+    textbooks = session.query(Textbook).filter(Textbook.downloaded_lesson_plan_num < 50).all()
+    # 直接过滤掉 no_lesson_plan_textbook 中存在的记录
+    filtered_textbooks = [tb for tb in textbooks if tb.id not in no_lp_tb_ids]
+    # 取前10个
+    selected = filtered_textbooks[:10]
 
     for tb in selected:
         textbook_id = tb.id
@@ -201,8 +228,9 @@ def fetch_lesson_plan_resources_for_random_subjects():
             print(f"Failed to fetch parts.json for {textbook_id}: {e}")
             continue
 
-        # 课程包url列表
         part_urls = [part for part in part_list]
+
+        all_course_bags_skipped = True  # 标记该 textbook 下所有 course_bag 是否 skip
 
         for url1 in part_urls:
             print(f"Fetching course bag from {url1}")
@@ -217,8 +245,13 @@ def fetch_lesson_plan_resources_for_random_subjects():
 
             for course_bag in course_bags:
                 course_bag_id = course_bag.get('id')
+                skip_download, skip_map = detail_download_pre_check(course_bag_id, session, ['lesson_plan'])
+                if not skip_download:
+                    all_course_bags_skipped = False
+                if skip_download:
+                    print(f"Skipping course bag {course_bag_id} due to all resources already processed...")
+                    continue
                 resource_type_code = course_bag.get('resource_type_code')
-                print(f"Processed course bag: resource_type_code - {resource_type_code}")
                 detail_json = None
                 if resource_type_code == 'elite_lesson':
                     urls = [
@@ -238,22 +271,91 @@ def fetch_lesson_plan_resources_for_random_subjects():
                 else:
                     print(f"Unsupported resource_type_code: {resource_type_code} for course_bag_id: {course_bag_id}")
                     continue
-                # 请求详情
                 for detail_url in urls:
                     try:
                         time.sleep(1)
                         resp = requests.get(detail_url, timeout=10)
                         if resp.status_code == 200:
                             detail_json = resp.json()
-                            process_lesson_plan_detail(detail_json, course_bag_id, textbook_id, session)
+                            relations = detail_json.get('relations', {})
+                            resource_list = []
+                            for v in relations.values():
+                                if isinstance(v, list):
+                                    resource_list.extend(v)
+                            process_lesson_plan_detail(detail_json, course_bag_id, textbook_id, session, skip_map)
                             break
                     except Exception as e:
                         import traceback
                         traceback.print_exc()
                         print(f"Failed to fetch detail for {course_bag_id} from {detail_url}: {e}")
                         continue
+
+        # 如果所有 course_bag 都 skip，则记录 textbook_id 到 no_lesson_plan_textbook
+        if all_course_bags_skipped:
+            if not session.query(NoLessonPlanTextbook).filter_by(textbook_id=textbook_id).first():
+                session.add(NoLessonPlanTextbook(textbook_id=textbook_id))
+                session.commit()
+            print(f"All course_bags for textbook {textbook_id} skipped, recorded in no_lesson_plan_textbook.")
+
     session.close()
+
+def update_lesson_plan_downloaded_status():
+    from collections import defaultdict
+    downloads_dir = os.path.join(os.path.dirname(__file__), '../temp_output/smartcn/downloads')
+    output_dir = os.path.join(os.path.dirname(__file__), '../temp_output/smartcn')
+    db_path = os.path.join(output_dir, 'textbooks.db')
+    Session = init_db(db_path)
+    session = Session()
+
+    # 1. 遍历downloads下所有子目录，统计每个course_bag_id下pdf数量
+    course_bag_pdf_count = {}
+    if os.path.exists(downloads_dir):
+        for course_bag_id in os.listdir(downloads_dir):
+            subdir = os.path.join(downloads_dir, course_bag_id)
+            if os.path.isdir(subdir):
+                pdf_count = 0
+                for root, _, files in os.walk(subdir):
+                    for file in files:
+                        if file.lower().endswith('.pdf'):
+                            pdf_count += 1
+                course_bag_pdf_count[course_bag_id] = pdf_count
+
+    # 2. 更新ResourceDownloadStatus表
+    all_status = session.query(ResourceDownloadStatus).all()
+    updated_ids = set()
+    for status in all_status:
+        cbid = status.course_bag_id
+        if cbid in course_bag_pdf_count:
+            status.lesson_plan = course_bag_pdf_count[cbid]
+            updated_ids.add(cbid)
+        else:
+            status.lesson_plan = 0
+    session.commit()
+
+    # 3. 输出每个course_bag_id的pdf数量
+    for cbid, count in course_bag_pdf_count.items():
+        print(f"{cbid}: {count} PDFs")
+
+    # 4. 统计ResourceDownloadStatus中lesson_plan的总和
+    total = session.query(func.sum(ResourceDownloadStatus.lesson_plan)).scalar() or 0
+    print(f"Total lesson plan PDFs recorded in DB: {total}")
+
+    # 5. 按textbook_id分组统计lesson_plan数量，并更新Textbook表
+    textbook_lesson_plan = session.query(
+        ResourceDownloadStatus.textbook_id,
+        func.sum(ResourceDownloadStatus.lesson_plan)
+    ).group_by(ResourceDownloadStatus.textbook_id).all()
+    for textbook_id, lesson_plan_num in textbook_lesson_plan:
+        if textbook_id:
+            tb = session.query(Textbook).filter(Textbook.id == textbook_id).first()
+            if tb:
+                tb.downloaded_lesson_plan_num = lesson_plan_num or 0
+    session.commit()
+
+    session.close()
+    return total
 
 if __name__ == "__main__":
     # process_textbooks()
     fetch_lesson_plan_resources_for_random_subjects()
+    # update_lesson_plan_downloaded_status()

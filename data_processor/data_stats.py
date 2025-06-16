@@ -2,14 +2,11 @@ import os
 import glob
 import matplotlib.pyplot as plt
 from transformers import AutoTokenizer
-from data_processor.process_pdf import ResourceProcessStatus
+from process_pdf import ResourceProcessStatus
 
 # 1. 获取所有已处理的 course_bag_id
 output_dir = os.path.join(os.path.dirname(__file__), '../temp_output/smartcn/processed')
-course_bag_ids = [
-    name for name in os.listdir(output_dir)
-    if os.path.isdir(os.path.join(output_dir, name))
-]
+course_bag_ids = ResourceProcessStatus.get_all_course_bag_ids()
 
 md_file_paths = []
 for course_bag_id in course_bag_ids:
@@ -18,6 +15,8 @@ for course_bag_id in course_bag_ids:
         continue
     md_files = glob.glob(os.path.join(lesson_plan_dir, "*.md"))
     md_file_paths.extend(md_files)
+
+print(f"被统计的文件数: {len(md_file_paths)}")
 
 word_counts = []
 token_counts = []
