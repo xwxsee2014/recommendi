@@ -4,7 +4,7 @@ import json
 import random
 import requests
 import time
-from sqlalchemy import create_engine, Column, String, Integer, and_, Boolean, func
+from sqlalchemy import create_engine, Column, String, Integer, and_, Boolean, func, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 # 1. 定义数据库模型
@@ -38,19 +38,80 @@ class NoLessonPlanTextbook(Base):
     __tablename__ = 'no_lesson_plan_textbook'
     textbook_id = Column(String, primary_key=True)
 
+class TextbookTM(Base):
+    __tablename__ = 'textbook_tm'
+    id = Column(String, primary_key=True)
+    tag_names = Column(String)
+    downloaded = Column(Integer, default=0)
+    processed = Column(Integer, default=0)
+
+    @staticmethod
+    def get_all_prcessed_ids():
+        """
+        获取所有processed=1的id
+        """
+        output_dir = os.path.join(os.path.dirname(__file__), '../temp_output/smartcn')
+        db_path = os.path.join(output_dir, 'textbooks.db')
+        Session = init_db(db_path)
+        session = Session()
+        ids = [row.id for row in session.query(TextbookTM.id).filter(TextbookTM.processed == 1).all()]
+        session.close()
+        return ids
+
+
 def init_db(db_path):
     engine = create_engine(f'sqlite:///{db_path}')
     Base.metadata.create_all(engine)
+    # 检查并添加 textbook_tm 新字段
+    # with engine.connect() as conn:
+    #     res = conn.execute(text("PRAGMA table_info(textbook_tm)")).fetchall()
+    #     columns = [r[1] for r in res]
+    #     if 'downloaded' not in columns:
+    #         conn.execute(text("ALTER TABLE textbook_tm ADD COLUMN downloaded INTEGER DEFAULT 0"))
+    #     if 'processed' not in columns:
+    #         conn.execute(text("ALTER TABLE textbook_tm ADD COLUMN processed INTEGER DEFAULT 0"))
     Session = sessionmaker(bind=engine)
     return Session
 
 # 全局 x-nd-auth header
-X_ND_AUTH = 'MAC id="7F938B205F876FC3A30551F3A49313836755C0D451C08FC17466435A155BBD9BCFBFF3776F22B0460E3F711306236F1764324EB8AA1C4A9D",nonce="1749979561001:W6SL8O8F",mac="SO377Mrz6MGcr0AkO0SWbTgLbo9xLq3Q6xvtpCEmmDQ="'
+X_ND_AUTH = 'MAC id="7F938B205F876FC3A30551F3A49313836755C0D451C08FC17466435A155BBD9BCFBFF3776F22B0460E3F711306236F1764324EB8AA1C4A9D",nonce="1750058593311:N9QJV128",mac="XzaP38z2kkzMSeCToWSyuNho3pcN89KMtNBpsvju2iM="'
 
 # 全局资源数量上限
 data_num_threshold = {
     "lesson_plan": 500
 }
+
+def process_textbook_tms():
+    # 读取所有 textbook_tm_*.json 文件
+    input_dir = os.path.join(os.path.dirname(__file__), '../temp_input/smartcn/textbook_tm')
+    json_files = glob.glob(os.path.join(input_dir, 'textbook_tm_*.json'))
+
+    all_items = []
+    for file in json_files:
+        with open(file, 'r', encoding='utf-8') as f:
+            items = json.load(f)
+            all_items.extend(items)
+
+    id_tag_names_pairs = []
+    for item in all_items:
+        if isinstance(item, dict) and 'id' in item and 'tag_list' in item:
+            id_ = item['id']
+            tag_list = item.get('tag_list', [])
+            tag_names = [tag.get('tag_name') for tag in tag_list if isinstance(tag, dict) and 'tag_name' in tag]
+            tag_names_str = ','.join(tag_names)
+            id_tag_names_pairs.append((id_, tag_names_str))
+
+    # 保存到sqlite
+    output_dir = os.path.join(os.path.dirname(__file__), '../temp_output/smartcn')
+    os.makedirs(output_dir, exist_ok=True)
+    db_path = os.path.join(output_dir, 'textbooks.db')
+    Session = init_db(db_path)
+    session = Session()
+
+    for id_, tag_names in id_tag_names_pairs:
+        session.merge(TextbookTM(id=id_, tag_names=tag_names))
+    session.commit()
+    session.close()
 
 def process_textbooks():
     # 读取所有 info_parts_*.json 文件
@@ -355,7 +416,89 @@ def update_lesson_plan_downloaded_status():
     session.close()
     return total
 
+def fetch_textbook_tm_resources():
+    """
+    遍历 textbook_tm 表中 downloaded=0 且 tag_names 包含'统编版'的行，下载PDF资源。
+    """
+    output_dir = os.path.join(os.path.dirname(__file__), '../temp_output/smartcn')
+    db_path = os.path.join(output_dir, 'textbooks.db')
+    Session = init_db(db_path)
+    session = Session()
+
+    # 查询 textbook_tm 表，downloaded=0 且 tag_names 包含'统编版'
+    tm_rows = session.query(TextbookTM).filter(
+        (TextbookTM.downloaded == False) | (TextbookTM.downloaded == None),
+        TextbookTM.tag_names.like('%人教版%')
+    ).all()
+
+    downloaded_count = session.query(TextbookTM).filter(TextbookTM.downloaded == True).count()
+
+    headers = {
+        "x-nd-auth": X_ND_AUTH
+    }
+
+    for tm in tm_rows:
+        textbook_tm_id = tm.id
+        print(f"Processing textbook_tm: {textbook_tm_id} (tags: {tm.tag_names})")
+        detail_url = f"https://s-file-2.ykt.cbern.com.cn/zxx/ndrv2/resources/tch_material/details/{textbook_tm_id}.json"
+        try:
+            time.sleep(1)
+            resp = requests.get(detail_url, timeout=15)
+            resp.raise_for_status()
+            detail_json = resp.json()
+        except Exception as e:
+            print(f"Failed to fetch detail for {textbook_tm_id}: {e}")
+            tm.processed = True
+            session.commit()
+            continue
+
+        ti_items = detail_json.get('ti_items', [])
+        pdf_downloaded = False
+        pdf_index = 1
+        for ti_item in ti_items:
+            if ti_item.get('ti_format') == 'pdf':
+                ti_storages = ti_item.get('ti_storages', [])
+                for storage in ti_storages:
+                    print(f"Processing storage: {storage}")
+                    pdf_url = storage if isinstance(storage, str) else storage.get('url') if isinstance(storage, dict) else None
+                    if not pdf_url:
+                        continue
+                    out_dir = os.path.join(os.path.dirname(__file__), f'../temp_output/smartcn/tm_downloads/{textbook_tm_id}')
+                    os.makedirs(out_dir, exist_ok=True)
+                    orig_filename = os.path.basename(pdf_url.split('?')[0])
+                    filename = f"{pdf_index:03d}_{orig_filename}"
+                    out_path = os.path.join(out_dir, filename)
+                    try:
+                        time.sleep(3)
+                        resp = requests.get(pdf_url, timeout=15, headers=headers)
+                        if resp.status_code == 200:
+                            with open(out_path, 'wb') as f:
+                                f.write(resp.content)
+                            print(f"Downloaded PDF: {out_path}")
+                            pdf_downloaded = True
+                            pdf_index += 1
+                            break  # 当前 ti_item 只下载一个 pdf
+                    except Exception as e:
+                        print(f"Failed to download PDF from {pdf_url}: {e}")
+                # 若已下载，跳出 ti_item 循环
+                if pdf_downloaded:
+                    break
+        tm.processed = True
+        if pdf_downloaded:
+            tm.downloaded = True
+            downloaded_count += 1
+        session.commit()
+        print(f"Current downloaded count: {downloaded_count}")
+
+    # 统计并显示 downloaded=1 的数量
+    total_downloaded = session.query(TextbookTM).filter(TextbookTM.downloaded == True).count()
+    print(f"Total textbook_tm downloaded: {total_downloaded}")
+
+    session.close()
+
 if __name__ == "__main__":
     # process_textbooks()
-    fetch_lesson_plan_resources_for_random_subjects()
+    # fetch_lesson_plan_resources_for_random_subjects()
     # update_lesson_plan_downloaded_status()
+    # process_textbook_tms()
+    fetch_textbook_tm_resources()

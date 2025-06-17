@@ -5,9 +5,9 @@ from magic_pdf.data.data_reader_writer import FileBasedDataWriter, FileBasedData
 from magic_pdf.data.dataset import PymuDocDataset
 from magic_pdf.model.doc_analyze_by_custom_model import doc_analyze
 from magic_pdf.config.enums import SupportedPdfParseMethod
-from sqlalchemy import create_engine, Column, String, Integer, func
+from sqlalchemy import create_engine, Column, String, Integer, func, Boolean
 from sqlalchemy.orm import declarative_base, sessionmaker, aliased
-from smartcn_resource_download import ResourceDownloadStatus
+from smartcn_resource_download import ResourceDownloadStatus, TextbookTM
 
 CLASSIFIED_JSON = os.path.join("temp_output", "k12", "classified_result.json")
 INPUT_BASE = os.path.join("temp_input", "k12", "download_files")
@@ -228,6 +228,58 @@ def process_unprocessed_lesson_plans():
     print(f"全部lesson_plan pdf处理完成，总计: {total_processed} 个。")
     session.close()
 
+def process_unprocessed_textbooks():
+    """
+    遍历 textbook_tm 表中 processed=0 的行，处理 tm_downloads 下的 pdf，输出到 tm_processed，并更新 processed=1。
+    """
+    output_dir = os.path.join(os.path.dirname(__file__), '../temp_output/smartcn')
+    db_path = os.path.join(output_dir, 'textbooks.db')
+    Session = init_db(db_path)
+    session = Session()
+
+    # 查询 textbook_tm 表，processed=0 且 downloaded=1
+    tm_rows = session.query(TextbookTM).filter(
+        (TextbookTM.processed == 0) &
+        (TextbookTM.downloaded == 1)
+    ).all()
+
+    total_to_process = len(tm_rows)
+    print(f"需要处理的 textbook_tm 总数: {total_to_process}")
+
+    processed_count = 0
+    for tm in tm_rows:
+        textbook_tm_id = tm.id
+        download_dir = os.path.join(output_dir, "tm_downloads", textbook_tm_id)
+        processed_dir = os.path.join(output_dir, "tm_processed", textbook_tm_id)
+        if not os.path.exists(download_dir):
+            print(f"下载目录不存在: {download_dir}")
+            tm.processed = True
+            session.commit()
+            continue
+        pdf_files = [f for f in os.listdir(download_dir) if f.lower().endswith('.pdf')]
+        pdf_files.sort()
+        if not pdf_files:
+            print(f"未找到pdf文件: {download_dir}")
+            tm.processed = True
+            session.commit()
+            continue
+        for pdf_file in pdf_files:
+            pdf_path = os.path.join(download_dir, pdf_file)
+            os.makedirs(processed_dir, exist_ok=True)
+            pdf_tag = os.path.splitext(pdf_file)[0]
+            process_pdf(pdf_path, processed_dir, pdf_tag)
+            print(f"已处理: {pdf_path} -> {processed_dir}")
+        tm.processed = True
+        session.commit()
+        processed_count += 1
+        print(f"[{processed_count}/{total_to_process}] 已处理 textbook_tm: {textbook_tm_id}")
+
+    total_processed = session.query(TextbookTM).filter(TextbookTM.processed == 1).count()
+    print(f"Total textbook_tm processed: {total_processed}")
+
+    session.close()
+
 if __name__ == "__main__":
     # pdf_path = "/home/xwxsee/projects/ai-content-generation/temp_input/k12/single_pdf_process/2020QJ08SXRJ005_practice.pdf"
-    process_unprocessed_lesson_plans()
+    # process_unprocessed_lesson_plans()
+    process_unprocessed_textbooks()
