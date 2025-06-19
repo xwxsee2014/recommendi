@@ -7,7 +7,7 @@ import argparse
 from tqdm import tqdm
 import shutil
 
-DATASET = "temp_output/smartcn/ir_datasets/lesson_plan"
+DATASET = "temp_output/smartcn/ir_datasets_splitted/tm_textbook"
 ES_INDEX_PREFIX = "bm25_es_"
 
 def sanitize_query_for_es(query):
@@ -82,7 +82,7 @@ def setup_es_index(dataset_name, docs, doc_ids):
         },
         "mappings": {
             "properties": {
-                "body": {
+                "content": {
                     "type": "text",
                     "analyzer": "ik_smart",
                     "search_analyzer": "ik_smart"
@@ -100,7 +100,7 @@ def setup_es_index(dataset_name, docs, doc_ids):
             "_index": index_name,
             "_id": doc_ids[i],
             "_source": {
-                "body": docs[i],
+                "content": docs[i],
                 "doc_id": doc_ids[i]
             }
         }
@@ -114,17 +114,17 @@ def setup_es_index(dataset_name, docs, doc_ids):
 
 def search_bm25(es, index_name, query, limit):
     query = sanitize_query_for_es(query)
-    body = {
+    content = {
         "query": {
             "match": {
-                "body": {
+                "content": {
                     "query": query,
                     "analyzer": "ik_smart"
                 }
             }
         }
     }
-    res = es.search(index=index_name, body=body, size=limit)
+    res = es.search(index=index_name, body=content, size=limit)
     hits = res["hits"]["hits"]
     return hits
 

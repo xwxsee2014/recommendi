@@ -3,9 +3,10 @@ import json
 import yaml
 
 class Document:
-    def __init__(self, doc_id, text):
+    def __init__(self, doc_id, text, metadata_fields=None):
         self.doc_id = doc_id
         self.text = text
+        self.metadata_fields = metadata_fields or {}
 
 class Query:
     def __init__(self, query_id, text):
@@ -35,14 +36,22 @@ class LocalDataset:
     def _load_docs(self):
         docs_info = self.metadata.get("files").get("documents", {})
         docs_path = os.path.join(self.dataset_path, docs_info.get("path", "docs.jsonl"))
-        doc_id_field = docs_info.get("id_field", "doc_id")
+        doc_id_field = docs_info.get("doc_id_field", "doc_id")
         text_field = docs_info.get("text_field", "text")
+        metadata_fields_list = docs_info.get("metadata_fields", [])
         docs = []
         if os.path.exists(docs_path):
             with open(docs_path, "r", encoding="utf-8") as f:
                 for line in f:
                     obj = json.loads(line)
-                    docs.append(Document(obj[doc_id_field], obj[text_field]))
+                    # 支持 doc_id_field 为 list 的情况
+                    if isinstance(doc_id_field, list):
+                        doc_id = "_".join(str(obj[field]) for field in doc_id_field)
+                    else:
+                        doc_id = obj[doc_id_field]
+                    # 提取 metadata_fields
+                    metadata_fields = {k: obj.get(k) for k in metadata_fields_list}
+                    docs.append(Document(doc_id, obj[text_field], metadata_fields))
         return docs
 
     def _load_queries(self):
@@ -62,6 +71,7 @@ class LocalDataset:
         qrels_info = self.metadata.get("files").get("qrels", {})
         qrels_path = os.path.join(self.dataset_path, qrels_info.get("path", "qrels.jsonl"))
         query_id_field = qrels_info.get("query_id_field", "query_id")
+        docs_field = qrels_info.get("docs_field", None)
         doc_id_field = qrels_info.get("doc_id_field", "doc_id")
         relevance_field = qrels_info.get("relevance_field", "relevance")
         qrels = []
@@ -69,7 +79,16 @@ class LocalDataset:
             with open(qrels_path, "r", encoding="utf-8") as f:
                 for line in f:
                     obj = json.loads(line)
-                    qrels.append(Qrel(obj[query_id_field], obj[doc_id_field], obj[relevance_field]))
+                    query_id = obj[query_id_field]
+                    if docs_field and docs_field in obj:
+                        for doc in obj[docs_field]:
+                            doc_id = doc[doc_id_field]
+                            relevance = doc[relevance_field]
+                            qrels.append(Qrel(query_id, doc_id, relevance))
+                    else:
+                        doc_id = obj[doc_id_field]
+                        relevance = obj[relevance_field]
+                        qrels.append(Qrel(query_id, doc_id, relevance))
         return qrels
 
     def docs_iter(self):
