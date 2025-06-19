@@ -171,10 +171,11 @@ def main(async_mode=False, reindex=False):
             if query_id not in qrels_dict or len(qrels_dict[query_id]) == 0:
                 continue
             results = search_sparse(client, query_text, limit)
-            retrieved_doc_ids = [hit["_payload"]["doc_id"] for hit in results]
-            relevant_doc_ids = qrels_dict[query_id]
+            # 去掉最后的 _{number} 并对 retrieved_doc_ids 和 relevant_doc_ids 都去重
+            retrieved_doc_ids = list(set([hit["_payload"]["doc_id"].rsplit("_", 1)[0] for hit in results]))
+            relevant_doc_ids = list(set([doc_id.rsplit("_", 1)[0] for doc_id in qrels_dict[query_id]]))
             relevant_retrieved = set(retrieved_doc_ids) & set(relevant_doc_ids)
-            recall = len(relevant_retrieved) / len(relevant_doc_ids)
+            recall = len(relevant_retrieved) / len(relevant_doc_ids) if relevant_doc_ids else 0
             recalls.append(recall)
             precision = len(relevant_retrieved) / limit
             precisions.append(precision)
@@ -204,10 +205,11 @@ async def main_async(docs, doc_ids, query_texts, query_ids, qrels_dict, reindex=
         tasks = [search_sparse_async(client, query_text, limit) for _, _, query_text in batch_queries]
         results = await asyncio.gather(*tasks)
         for i, (idx, query_id, _) in enumerate(batch_queries):
-            retrieved_doc_ids = [hit["_payload"]["doc_id"] for hit in results[i]]
-            relevant_doc_ids = qrels_dict[query_id]
+            # 修改：去掉最后的 _{number} 并去重
+            retrieved_doc_ids = list(set([hit["_payload"]["doc_id"].rsplit("_", 1)[0] for hit in results[i]]))
+            relevant_doc_ids = list(set([doc_id.rsplit("_", 1)[0] for doc_id in qrels_dict[query_id]]))
             relevant_retrieved = set(retrieved_doc_ids) & set(relevant_doc_ids)
-            recall = len(relevant_retrieved) / len(relevant_doc_ids)
+            recall = len(relevant_retrieved) / len(relevant_doc_ids) if relevant_doc_ids else 0
             recalls.append(recall)
             precision = len(relevant_retrieved) / limit
             precisions.append(precision)

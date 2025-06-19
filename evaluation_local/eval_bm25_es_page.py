@@ -7,8 +7,8 @@ import argparse
 from tqdm import tqdm
 import shutil
 
-# DATASET = "temp_output/smartcn/ir_datasets_splitted/tm_textbook"
-DATASET = "temp_output/smartcn/ir_datasets_splitted/lesson_plan"
+DATASET = "temp_output/smartcn/ir_datasets_splitted/tm_textbook"
+# DATASET = "temp_output/smartcn/ir_datasets_splitted/lesson_plan"
 ES_INDEX_PREFIX = "bm25_es_"
 
 def sanitize_query_for_es(query):
@@ -163,10 +163,11 @@ def main(async_mode=False):
         if query_id not in qrels_dict or len(qrels_dict[query_id]) == 0:
             continue
         results = search_bm25(es, index_name, query_text, limit)
-        retrieved_doc_ids = [hit["_source"]["doc_id"] for hit in results]
-        relevant_doc_ids = qrels_dict[query_id]
+        # 去掉最后的 _{number} 并对 retrieved_doc_ids 和 relevant_doc_ids 都去重
+        retrieved_doc_ids = list(set([hit["_source"]["doc_id"].rsplit("_", 1)[0] for hit in results]))
+        relevant_doc_ids = list(set([doc_id.rsplit("_", 1)[0] for doc_id in qrels_dict[query_id]]))
         relevant_retrieved = set(retrieved_doc_ids) & set(relevant_doc_ids)
-        recall = len(relevant_retrieved) / len(relevant_doc_ids)
+        recall = len(relevant_retrieved) / len(relevant_doc_ids) if relevant_doc_ids else 0
         recalls.append(recall)
         precision = len(relevant_retrieved) / limit
         precisions.append(precision)

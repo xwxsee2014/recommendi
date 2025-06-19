@@ -1,6 +1,6 @@
 from qdrant_client import QdrantClient, models
 from tqdm import tqdm
-import ir_datasets
+import utils.ir_local_datasets as ir_datasets
 import os
 import hashlib
 import uuid
@@ -8,7 +8,8 @@ import asyncio
 from qdrant_client.async_qdrant_client import AsyncQdrantClient
 from sentence_transformers import SentenceTransformer
 
-DATASET = "beir/quora/test"
+# DATASET = "temp_output/smartcn/ir_datasets_splitted/tm_textbook"
+DATASET = "temp_output/smartcn/ir_datasets_splitted/lesson_plan"
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", None)
 COLLECTION_NAME = DATASET.replace("/", "_") + "_minilm_l6_v2"
@@ -20,7 +21,13 @@ model = SentenceTransformer("all-MiniLM-L6-v2")
 def load_nfcorpus():
     dataset = ir_datasets.load(DATASET)
     # corpus: dict[str, dict], queries: dict[str, str], qrels: dict[str, dict[str, int]]
-    corpus = {doc.doc_id: {"text": doc.text} for doc in dataset.docs_iter()}
+    corpus = {
+        doc.doc_id: {
+            "text": doc.text,
+            "metadata_fields": getattr(doc, "metadata_fields", {})  # 支持 metadata_fields
+        }
+        for doc in dataset.docs_iter()
+    }
     queries = {q.query_id: q.text for q in dataset.queries_iter()}
     qrels = {}
     for qrel in dataset.qrels_iter():
@@ -29,7 +36,13 @@ def load_nfcorpus():
         qrels[qrel.query_id][qrel.doc_id] = qrel.relevance
 
     # Convert to list format
-    docs = [corpus[doc_id]["text"] for doc_id in corpus]
+    docs = [
+        {
+            "text": corpus[doc_id]["text"],
+            "metadata_fields": corpus[doc_id]["metadata_fields"]
+        }
+        for doc_id in corpus
+    ]
     doc_ids = list(corpus.keys())
     query_texts = [queries[qid] for qid in queries]
     query_ids = list(queries.keys())
@@ -42,34 +55,26 @@ def load_nfcorpus():
     print(f"{len(docs)} documents loaded.")
     print(f"{len(query_texts)} queries loaded.")
     print(f"{len(qrels_dict)} queries with relevant documents.")
-    # qrels_dict 中最小长度
-    min_relevant_docs = min(len(dids) for dids in qrels_dict.values()) if qrels_dict else 0
-    # qrels_dict 中最大长度
-    max_relevant_docs = max(len(dids) for dids in qrels_dict.values()) if qrels_dict else 0
-    # qrels_dict 中平均长度
-    avg_relevant_docs = sum(len(dids) for dids in qrels_dict.values()) / len(qrels_dict) if qrels_dict else 0
-    # qrels_dict 中长度中位数
-    median_relevant_docs = sorted(len(dids) for dids in qrels_dict.values())[len(qrels_dict) // 2] if qrels_dict else 0
-    print(f"Median relevant documents per query: {median_relevant_docs}")
-    print(f"Average relevant documents per query: {avg_relevant_docs:.2f}")
-    print(f"Maximum relevant documents per query: {max_relevant_docs}")
-    print(f"Minimum relevant documents per query: {min_relevant_docs}")
+    if qrels_dict:
+        min_relevant_docs = min(len(dids) for dids in qrels_dict.values())
+        max_relevant_docs = max(len(dids) for dids in qrels_dict.values())
+        avg_relevant_docs = sum(len(dids) for dids in qrels_dict.values()) / len(qrels_dict)
+        median_relevant_docs = sorted(len(dids) for dids in qrels_dict.values())[len(qrels_dict) // 2]
+        print(f"Median relevant documents per query: {median_relevant_docs}")
+        print(f"Average relevant documents per query: {avg_relevant_docs:.2f}")
+        print(f"Maximum relevant documents per query: {max_relevant_docs}")
+        print(f"Minimum relevant documents per query: {min_relevant_docs}")
 
     return docs, doc_ids, query_texts, query_ids, qrels_dict
 
 def index_docs(docs, doc_ids, reindex=False):
     print("Indexing documents with SentenceTransformer...")
     client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=True)
-    
-    # Delete collection if exists and reindex is True
     if client.collection_exists(COLLECTION_NAME):
         if reindex:
             client.delete_collection(COLLECTION_NAME)
         else:
-            # If not reindexing, just return the client
             return client
-    
-    # Create collection with dense vector config
     client.create_collection(
         collection_name=COLLECTION_NAME,
         vectors_config=models.VectorParams(
@@ -77,43 +82,36 @@ def index_docs(docs, doc_ids, reindex=False):
             distance=models.Distance.COSINE
         )
     )
-    
-    # Index documents in batches
     batch_size = 64
     for i in tqdm(range(0, len(docs), batch_size)):
         batch_docs = docs[i:i+batch_size]
         batch_ids = doc_ids[i:i+batch_size]
-        
-        # Get embeddings
-        embeddings = model.encode(batch_docs, convert_to_numpy=True)
-        
-        # Create points
+        texts = [doc["text"] for doc in batch_docs]
+        embeddings = model.encode(texts, convert_to_numpy=True, device="cuda")
         points = []
         for j, embedding in enumerate(embeddings):
             doc_id = batch_ids[j]
-            # If doc_id is purely numeric, use it directly; otherwise, use UUID
+            doc = batch_docs[j]
             if isinstance(doc_id, int):
                 point_id = doc_id
             else:
-                # Convert doc_id to UUID using MD5
                 doc_id_str = str(doc_id)
                 md5_hash = hashlib.md5(doc_id_str.encode()).hexdigest()
                 point_id = str(uuid.UUID(md5_hash))
-            
             points.append(models.PointStruct(
                 id=point_id,
-                vector=embeddings[j].tolist(),
-                payload={"doc_id": doc_id, "text": batch_docs[j]}
+                vector=embedding.tolist(),
+                payload={
+                    "doc_id": doc_id,
+                    "text": doc["text"],
+                    "metadata_fields": doc.get("metadata_fields", {})
+                }
             ))
-        
-        # Upload points
         client.upsert(
             collection_name=COLLECTION_NAME,
             points=points,
             wait=True
         )
-    
-    # print(f"Indexed {len(docs)} documents into collection '{COLLECTION_NAME}'")
     return client
 
 def search_sparse(client, query, limit=10):
@@ -124,23 +122,35 @@ def search_sparse(client, query, limit=10):
         limit=limit,
         with_payload=True
     )
-    return result
+    # 返回结构与 BM25 类似
+    hits = []
+    for hit in result:
+        hits.append({
+            "_id": hit.id,
+            "_score": hit.score,
+            "_payload": hit.payload
+        })
+    return hits
 
 async def search_sparse_async(client, query, limit=10):
-    # Run the CPU-bound embedding operation in a thread pool to avoid blocking the event loop
     query_vector = await asyncio.get_event_loop().run_in_executor(
         None, 
         lambda: model.encode(query, convert_to_numpy=True)
     )
-    
-    result = await client.query_points(
+    result = await client.search(
         collection_name=COLLECTION_NAME,
-        query=query_vector,
-        using="cosine",
-        with_payload=True,
-        limit=limit
+        query_vector=query_vector,
+        limit=limit,
+        with_payload=True
     )
-    return result
+    hits = []
+    for hit in result:
+        hits.append({
+            "_id": hit.id,
+            "_score": hit.score,
+            "_payload": hit.payload
+        })
+    return hits
 
 def main(async_mode=False, reindex=False):
     # Load data
@@ -155,12 +165,10 @@ def main(async_mode=False, reindex=False):
     else:
         # Evaluation
         limit = 10
-        number_of_queries = min(len(query_texts), 100_000)
-        
         recalls = []
         precisions = []
         
-        for idx in tqdm(range(number_of_queries), desc="Evaluating queries"):
+        for idx in tqdm(range(len(query_texts)), desc="Evaluating queries"):
             query_id = query_ids[idx]
             query_text = query_texts[idx]
             
@@ -170,11 +178,11 @@ def main(async_mode=False, reindex=False):
                 
             # Search using SentenceTransformer
             results = search_sparse(client, query_text, limit)
-            retrieved_doc_ids = [hit.payload["doc_id"] for hit in results]
+            # 修正此处，适配 hits 结构
+            retrieved_doc_ids = [hit["_payload"]["doc_id"] for hit in results]
             
             # Calculate metrics
             relevant_doc_ids = qrels_dict[query_id]
-            print(f"Query ID: {query_id}, Retrieved: {len(retrieved_doc_ids)}, Relevant: {len(relevant_doc_ids)}")
             relevant_retrieved = set(retrieved_doc_ids) & set(relevant_doc_ids)
             
             # Recall@10: proportion of relevant docs retrieved in top-10
@@ -184,8 +192,6 @@ def main(async_mode=False, reindex=False):
             # Precision@10: proportion of retrieved docs that are relevant
             precision = len(relevant_retrieved) / limit
             precisions.append(precision)
-            
-            print(f"Query {idx+1}/{number_of_queries}: {query_id}, Recall@10: {recall:.3f}, Precision@10: {precision:.3f}")
     
         # Report overall results
         average_recall = sum(recalls) / len(recalls)
@@ -204,15 +210,13 @@ async def main_async(docs, doc_ids, query_texts, query_ids, qrels_dict, reindex=
     # Note: Async indexing is not implemented; assumes sync indexing already done.
     # Evaluation
     limit = 10
-    number_of_queries = min(len(query_texts), 100_000)
-    
     recalls = []
     precisions = []
     
     # Process queries in batches for better async performance
     batch_size = 20  # Increased batch size for better concurrency
-    for batch_start in tqdm(range(0, number_of_queries, batch_size), desc="Processing query batches"):
-        batch_end = min(batch_start + batch_size, number_of_queries)
+    for batch_start in tqdm(range(0, len(query_texts), batch_size), desc="Processing query batches"):
+        batch_end = min(batch_start + batch_size, len(query_texts))
         batch_queries = []
         
         # Prepare the batch without awaiting
@@ -234,7 +238,8 @@ async def main_async(docs, doc_ids, query_texts, query_ids, qrels_dict, reindex=
         
         # Process results
         for i, (idx, query_id, _) in enumerate(batch_queries):
-            retrieved_doc_ids = [hit.payload["doc_id"] for hit in results[i]]
+            # 修正此处，适配 hits 结构
+            retrieved_doc_ids = [hit["_payload"]["doc_id"] for hit in results[i]]
             
             # Calculate metrics
             relevant_doc_ids = qrels_dict[query_id]
@@ -247,8 +252,6 @@ async def main_async(docs, doc_ids, query_texts, query_ids, qrels_dict, reindex=
             # Precision@10: proportion of retrieved docs that are relevant
             precision = len(relevant_retrieved) / limit
             precisions.append(precision)
-            
-            print(f"Query {idx+1}/{number_of_queries}: {query_id}, Recall@10: {recall:.3f}, Precision@10: {precision:.3f}")
     
     # Report overall results
     average_recall = sum(recalls) / len(recalls)
