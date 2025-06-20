@@ -3,7 +3,7 @@ import json
 import hashlib
 
 from process_pdf import ResourceProcessStatus, init_db
-from smartcn_resource_download import TextbookTM, LessonPlanResourceMeta
+from smartcn_resource_download import TextbookTM
 from query_generator import CorpusQuery
 
 RESOURCE_CATEGORY_CONFIG = {
@@ -12,25 +12,14 @@ RESOURCE_CATEGORY_CONFIG = {
         'ir_dataset_dir': lambda output_dir: os.path.join(output_dir, 'ir_datasets_splitted', 'lesson_plan'),
         'db_rows': lambda session: session.query(ResourceProcessStatus.course_bag_id).filter(ResourceProcessStatus.lesson_plan > 0).all(),
         'get_course_bag_id': lambda row: row.course_bag_id,
-        'get_tag_names': lambda row: None,
-        # 固化 meta_map 的生成
-        'get_meta_map': lambda session: {
-            (meta.course_bag_id, meta.filename): meta
-            for meta in session.query(LessonPlanResourceMeta).all()
-        }
+        'get_tag_names': lambda row: None
     },
     'tm_textbook': {
         'processed_dir': lambda output_dir, course_bag_id: os.path.join(output_dir, "tm_processed", course_bag_id),
         'ir_dataset_dir': lambda output_dir: os.path.join(output_dir, 'ir_datasets_splitted', 'tm_textbook'),
         'db_rows': lambda session: session.query(TextbookTM.id, TextbookTM.tag_names).filter(TextbookTM.processed > 0).all(),
         'get_course_bag_id': lambda row: row.id,
-        'get_tag_names': lambda row: row.tag_names,
-        # 新增 meta_map 获取逻辑，key 为 (id, filename)
-        'get_meta_map': lambda session: {
-            (meta.id, meta.filename): meta
-            for meta in session.query(TextbookTM).all()
-            if meta.filename is not None
-        }
+        'get_tag_names': lambda row: row.tag_names
     }
 }
 
@@ -44,9 +33,6 @@ def build_resource_ir_dataset_corpus(resource_category):
     Session = init_db(db_path)
     session = Session()
 
-    # 通用 meta_map 获取
-    meta_map = config['get_meta_map'](session) if 'get_meta_map' in config else None
-
     rows = config['db_rows'](session)
     print(f"Found {len(rows)} resources for {resource_category}")
     docs = []
@@ -58,11 +44,14 @@ def build_resource_ir_dataset_corpus(resource_category):
         processed_dir = config['processed_dir'](output_dir, course_bag_id)
         if not os.path.exists(processed_dir):
             continue
+        # 针对 tm_textbook 获取 tag_names 字段
         for fname in os.listdir(processed_dir):
-            pdf_filename_stem = ""
             if fname.lower().endswith('_middle.json'):
                 file_stem = os.path.splitext(fname)[0]
-                pdf_filename_stem = file_stem.replace('_middle', '')
+                if not all(c.isalnum() or c in "_-" for c in file_stem):
+                    file_stem_safe = hashlib.md5(file_stem.encode("utf-8")).hexdigest()
+                else:
+                    file_stem_safe = file_stem
                 json_path = os.path.join(processed_dir, fname)
                 with open(json_path, "r", encoding="utf-8") as f:
                     try:
@@ -71,26 +60,12 @@ def build_resource_ir_dataset_corpus(resource_category):
                         print(f"Failed to load {json_path}: {e}")
                         continue
                 pdf_info = data.get("pdf_info", [])
-                # --- meta lookup ---
-                meta = None
-                if meta_map is not None:
-                    # lesson_plan: key = (course_bag_id, pdf_filename)
-                    # tm_textbook: key = (id, filename)
-                    if resource_category == "lesson_plan":
-                        pdf_filename = f"{pdf_filename_stem}.pdf"
-                        meta = meta_map.get((course_bag_id, pdf_filename))
-                    elif resource_category == "tm_textbook":
-                        pdf_filename = f"{pdf_filename_stem}.pdf"
-                        meta = meta_map.get((course_bag_id, pdf_filename))
-                    if not meta:
-                        print(f"Meta not found for ({course_bag_id}, {pdf_filename}), skipping.")
-                        continue
-                # --- end meta lookup ---
                 for page in pdf_info:
                     page_idx = page.get("page_idx")
                     para_blocks = page.get("para_blocks", [])
                     page_size = page.get("page_size", None)
                     for idx, para in enumerate(para_blocks):
+                        # 收集 para_blocks 中 type
                         para_type = para.get("type")
                         if para_type is not None:
                             para_types_set.add(para_type)
@@ -106,6 +81,7 @@ def build_resource_ir_dataset_corpus(resource_category):
                                     if not spans:
                                         continue
                                     for span in spans:
+                                        # 收集 span 中 type
                                         span_type = span.get("type")
                                         if span_type is not None:
                                             span_types_set.add(span_type)
@@ -123,6 +99,7 @@ def build_resource_ir_dataset_corpus(resource_category):
                                     continue
                                 line_content = []
                                 for span in spans:
+                                    # 收集 span 中 type
                                     span_type = span.get("type")
                                     if span_type is not None:
                                         span_types_set.add(span_type)
@@ -141,36 +118,14 @@ def build_resource_ir_dataset_corpus(resource_category):
                         if not merged_contents:
                             continue
                         content = "".join(merged_contents)
-                        # --- doc construction ---
-                        if meta is not None:
-                            # lesson_plan: meta 字段来自 LessonPlanResourceMeta
-                            # tm_textbook: meta 字段来自 TextbookTM
-                            doc_id = f"{meta.id}_{page_idx}_{idx}"
-                            page_id = f"{meta.id}_{page_idx}"
-                            doc = {
-                                "doc_id": doc_id,
-                                "page_id": page_id,
-                                "id": meta.id,
-                                "resource_type_code": getattr(meta, "resource_type_code", None),
-                                "resource_type_code_name": getattr(meta, "resource_type_code_name", None),
-                                "container_id": getattr(meta, "container_id", None),
-                                "tag_list": getattr(meta, "tag_list", None),
-                                "parent_id": getattr(meta, "course_bag_id", None) if hasattr(meta, "course_bag_id") else None,
-                                "page_idx": page_idx,
-                                "bbox": bbox,
-                                "bbox_index": idx,
-                                "page_size": page_size,
-                                "text": content
-                            }
-                        else:
-                            doc = {
-                                "doc_id": doc_id,
-                                "page_idx": page_idx,
-                                "bbox": bbox,
-                                "bbox_index": idx,
-                                "page_size": page_size,
-                                "text": content
-                            }
+                        doc = {
+                            "doc_id": f"{course_bag_id}_{resource_category}_{file_stem_safe}_{page_idx}",
+                            "page_idx": page_idx,
+                            "bbox": bbox,
+                            "bbox_index": idx,
+                            "page_size": page_size,
+                            "text": content
+                        }
                         if tag_names is not None:
                             doc["tag_names"] = tag_names
                         docs.append(doc)
@@ -316,202 +271,12 @@ def build_resource_ir_dataset_qrel(resource_category):
             f.write(json.dumps(qrel, ensure_ascii=False) + "\n")
     print(f"Qrels written to {out_path}, total qrels: {len(qrels)}")
 
-def regenerate_lesson_plan_queries_and_qrels_with_new_ids():
-    """
-    重新生成 lesson_plan 的 queries.jsonl 和 qrels.jsonl，变换 query_id 和 doc_id，并生成 queries_mapping.jsonl。
-    """
-    output_dir = os.path.join(os.path.dirname(__file__), '../temp_output/smartcn')
-    ir_dataset_dir = os.path.join(output_dir, 'ir_datasets_splitted', 'lesson_plan')
-    db_path = os.path.join(output_dir, 'textbooks.db')
-    queries_path = os.path.join(ir_dataset_dir, "queries.jsonl")
-    qrels_path = os.path.join(ir_dataset_dir, "qrels.jsonl")
-    mapping_path = os.path.join(ir_dataset_dir, "queries_mapping.jsonl")
-
-    # 1. 加载 LessonPlanResourceMeta
-    Session = init_db(db_path)
-    session = Session()
-    meta_map = {}
-    for meta in session.query(LessonPlanResourceMeta).all():
-        meta_map[(meta.course_bag_id, meta.filename_code)] = meta
-    session.close()
-
-    # 2. 读取 queries.jsonl，生成 mapping
-    mapping_list = []
-    old_to_new_queryid = {}
-    with open(queries_path, "r", encoding="utf-8") as f:
-        queries = [json.loads(line) for line in f]
-    new_queries = []
-    for q in queries:
-        old_query_id = q["query_id"]
-        # 解析 old_query_id: {course_bag_id}_{resource_category}_{filename_code}_{page_idx}_{query_idx}
-        parts = old_query_id.split("_")
-        if len(parts) < 6:
-            print(f"Invalid query_id format: {old_query_id}")
-            exit(1)
-        course_bag_id = parts[0]
-        filename_code = "_".join(parts[3:-2])
-        page_idx = parts[-2]
-        query_idx = parts[-1]
-        meta_key = (course_bag_id, filename_code)
-        meta = meta_map.get(meta_key)
-        if not meta:
-            print(f"Meta not found for ({course_bag_id}, {filename_code}), abort.")
-            exit(1)
-        new_query_id = f"{meta.id}_{page_idx}_{query_idx}"
-        mapping = {
-            "old_query_id": old_query_id,
-            "new_query_id": new_query_id,
-            "doc_id": meta.id,
-            "page_idx": page_idx
-        }
-        mapping_list.append(mapping)
-        old_to_new_queryid[old_query_id] = mapping
-        new_q = dict(q)
-        new_q["query_id"] = new_query_id
-        new_queries.append(new_q)
-    # 写入 mapping
-    with open(mapping_path, "w", encoding="utf-8") as f:
-        for m in mapping_list:
-            f.write(json.dumps(m, ensure_ascii=False) + "\n")
-    print(f"Mapping written to {mapping_path}, total: {len(mapping_list)}")
-
-    # 写入新的 queries.jsonl
-    new_queries_path = os.path.join(ir_dataset_dir, "queries.jsonl")
-    with open(new_queries_path, "w", encoding="utf-8") as f:
-        for q in new_queries:
-            f.write(json.dumps(q, ensure_ascii=False) + "\n")
-    print(f"New queries.jsonl written to {new_queries_path}")
-
-    # 3. 替换 qrels.jsonl 中的 doc_id
-    with open(qrels_path, "r", encoding="utf-8") as f:
-        qrels = [json.loads(line) for line in f]
-    new_qrels = []
-    for qrel in qrels:
-        old_query_id = qrel["query_id"]
-        mapping = old_to_new_queryid.get(old_query_id)
-        new_query_id = mapping["new_query_id"]
-        new_docs = []
-        for doc in qrel["docs"]:
-            doc_parts = doc["doc_id"].split("_")
-            para_idx = doc_parts[-1]
-            new_doc_id = f"{mapping['doc_id']}_{mapping['page_idx']}_{para_idx}"
-            new_docs.append({
-                "doc_id": new_doc_id,
-                "relevance": doc["relevance"]
-            })
-        new_qrels.append({
-            "query_id": new_query_id,
-            "docs": new_docs
-        })
-    # 写入新的 qrels.jsonl
-    new_qrels_path = os.path.join(ir_dataset_dir, "qrels.jsonl")
-    with open(new_qrels_path, "w", encoding="utf-8") as f:
-        for qrel in new_qrels:
-            f.write(json.dumps(qrel, ensure_ascii=False) + "\n")
-    print(f"New qrels.jsonl written to {new_qrels_path}")
-
-def regenerate_tm_textbook_queries_and_qrels_with_new_ids():
-    """
-    重新生成 tm_textbook 的 queries.jsonl 和 qrels.jsonl，变换 query_id 和 doc_id，并生成 queries_mapping.jsonl。
-    """
-    output_dir = os.path.join(os.path.dirname(__file__), '../temp_output/smartcn')
-    ir_dataset_dir = os.path.join(output_dir, 'ir_datasets_splitted', 'tm_textbook')
-    db_path = os.path.join(output_dir, 'textbooks.db')
-    queries_path = os.path.join(ir_dataset_dir, "queries.jsonl")
-    qrels_path = os.path.join(ir_dataset_dir, "qrels.jsonl")
-    mapping_path = os.path.join(ir_dataset_dir, "queries_mapping.jsonl")
-
-    # 1. 加载 TextbookTM
-    Session = init_db(db_path)
-    session = Session()
-    meta_map = {}
-    for meta in session.query(TextbookTM).all():
-        meta_map[(meta.id, meta.filename_code)] = meta
-    session.close()
-
-    # 2. 读取 queries.jsonl，生成 mapping
-    mapping_list = []
-    old_to_new_queryid = {}
-    with open(queries_path, "r", encoding="utf-8") as f:
-        queries = [json.loads(line) for line in f]
-    new_queries = []
-    for q in queries:
-        old_query_id = q["query_id"]
-        # 解析 old_query_id: {id}_{resource_category}_{filename_code}_{page_idx}_{query_idx}
-        parts = old_query_id.split("_")
-        if len(parts) < 6:
-            print(f"Invalid query_id format: {old_query_id}")
-            exit(1)
-        id_ = parts[0]
-        filename_code = "_".join(parts[3:-2])
-        page_idx = parts[-2]
-        query_idx = parts[-1]
-        meta_key = (id_, filename_code)
-        meta = meta_map.get(meta_key)
-        if not meta:
-            print(f"Meta not found for ({id_}, {filename_code}), abort.")
-            exit(1)
-        new_query_id = f"{meta.id}_{page_idx}_{query_idx}"
-        mapping = {
-            "old_query_id": old_query_id,
-            "new_query_id": new_query_id,
-            "doc_id": meta.id,
-            "page_idx": page_idx
-        }
-        mapping_list.append(mapping)
-        old_to_new_queryid[old_query_id] = mapping
-        new_q = dict(q)
-        new_q["query_id"] = new_query_id
-        new_queries.append(new_q)
-    # 写入 mapping
-    with open(mapping_path, "w", encoding="utf-8") as f:
-        for m in mapping_list:
-            f.write(json.dumps(m, ensure_ascii=False) + "\n")
-    print(f"Mapping written to {mapping_path}, total: {len(mapping_list)}")
-
-    # 写入新的 queries.jsonl
-    new_queries_path = os.path.join(ir_dataset_dir, "queries.jsonl")
-    with open(new_queries_path, "w", encoding="utf-8") as f:
-        for q in new_queries:
-            f.write(json.dumps(q, ensure_ascii=False) + "\n")
-    print(f"New queries.jsonl written to {new_queries_path}")
-
-    # 3. 替换 qrels.jsonl 中的 doc_id
-    with open(qrels_path, "r", encoding="utf-8") as f:
-        qrels = [json.loads(line) for line in f]
-    new_qrels = []
-    for qrel in qrels:
-        old_query_id = qrel["query_id"]
-        mapping = old_to_new_queryid.get(old_query_id)
-        new_query_id = mapping["new_query_id"]
-        new_docs = []
-        for doc in qrel["docs"]:
-            doc_parts = doc["doc_id"].split("_")
-            para_idx = doc_parts[-1]
-            new_doc_id = f"{mapping['doc_id']}_{mapping['page_idx']}_{para_idx}"
-            new_docs.append({
-                "doc_id": new_doc_id,
-                "relevance": doc["relevance"]
-            })
-        new_qrels.append({
-            "query_id": new_query_id,
-            "docs": new_docs
-        })
-    # 写入新的 qrels.jsonl
-    new_qrels_path = os.path.join(ir_dataset_dir, "qrels.jsonl")
-    with open(new_qrels_path, "w", encoding="utf-8") as f:
-        for qrel in new_qrels:
-            f.write(json.dumps(qrel, ensure_ascii=False) + "\n")
-    print(f"New qrels.jsonl written to {new_qrels_path}")
-
 if __name__ == "__main__":
-    docs = build_resource_ir_dataset_corpus('tm_textbook')
-    output_resource_merged_docs_jsonl(docs, 'tm_textbook')
+    # docs = build_resource_ir_dataset_corpus('tm_textbook')
+    # output_resource_merged_docs_jsonl(docs, 'tm_textbook')
     # docs = build_resource_ir_dataset_corpus('lesson_plan')
     # output_resource_merged_docs_jsonl(docs, 'lesson_plan')
-    # build_resource_ir_dataset_query('tm_textbook')
-    # build_resource_ir_dataset_query('lesson_plan')
-    # build_resource_ir_dataset_qrel('tm_textbook')
-    # build_resource_ir_dataset_qrel('lesson_plan')
-    # build_resource_ir_dataset_qrel('tm_textbook')
-    # build_resource_ir_dataset_qrel('lesson_plan')
+    build_resource_ir_dataset_query('tm_textbook')
+    build_resource_ir_dataset_query('lesson_plan')
+    build_resource_ir_dataset_qrel('tm_textbook')
+    build_resource_ir_dataset_qrel('lesson_plan')
