@@ -520,5 +520,3 @@ if __name__ == "__main__":
     # build_resource_ir_dataset_query('lesson_plan')
     # build_resource_ir_dataset_qrel('tm_textbook')
     # build_resource_ir_dataset_qrel('lesson_plan')
-    # build_resource_ir_dataset_qrel('tm_textbook')
-    # build_resource_ir_dataset_qrel('lesson_plan')
