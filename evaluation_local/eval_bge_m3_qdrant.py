@@ -8,9 +8,10 @@ import asyncio
 from qdrant_client.async_qdrant_client import AsyncQdrantClient
 import requests
 from typing import List
+import json
 
-DATASET = "temp_output/smartcn/ir_datasets_splitted/tm_textbook"
-# DATASET = "temp_output/smartcn/ir_datasets_splitted/lesson_plan"
+# DATASET = "temp_output/smartcn/ir_datasets_splitted/tm_textbook"
+DATASET = "temp_output/smartcn/ir_datasets_splitted/lesson_plan"
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", None)
 COLLECTION_NAME = DATASET.replace("/", "_") + "_bge_m3"
@@ -101,14 +102,26 @@ def index_docs(docs, doc_ids, reindex=False):
                 doc_id_str = str(doc_id)
                 md5_hash = hashlib.md5(doc_id_str.encode()).hexdigest()
                 point_id = str(uuid.UUID(md5_hash))
+            # Prepare payload with metadata_fields flattened (first level only), skip key conflicts
+            payload = {
+                "doc_id": doc_id,
+                "text": doc["text"]
+            }
+            metadata_fields = doc.get("metadata_fields", {})
+            for k, v in metadata_fields.items():
+                if k not in payload:
+                    # 如果 v 是 json string，尝试转换为 json 对象
+                    if isinstance(v, str):
+                        try:
+                            v_json = json.loads(v)
+                            v = v_json
+                        except Exception:
+                            pass
+                    payload[k] = v
             points.append(models.PointStruct(
                 id=point_id,
                 vector=embedding,
-                payload={
-                    "doc_id": doc_id,
-                    "text": doc["text"],
-                    "metadata_fields": doc.get("metadata_fields", {})
-                }
+                payload=payload
             ))
         client.upsert(
             collection_name=COLLECTION_NAME,

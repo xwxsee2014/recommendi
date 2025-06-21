@@ -507,8 +507,8 @@ def regenerate_tm_textbook_queries_and_qrels_with_new_ids():
 if __name__ == "__main__":
     docs = build_resource_ir_dataset_corpus('tm_textbook')
     output_resource_merged_docs_jsonl(docs, 'tm_textbook')
-    # docs = build_resource_ir_dataset_corpus('lesson_plan')
-    # output_resource_merged_docs_jsonl(docs, 'lesson_plan')
+    docs = build_resource_ir_dataset_corpus('lesson_plan')
+    output_resource_merged_docs_jsonl(docs, 'lesson_plan')
     # build_resource_ir_dataset_query('tm_textbook')
     # build_resource_ir_dataset_query('lesson_plan')
     # build_resource_ir_dataset_qrel('tm_textbook')
