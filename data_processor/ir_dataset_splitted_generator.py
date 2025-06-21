@@ -34,6 +34,138 @@ RESOURCE_CATEGORY_CONFIG = {
     }
 }
 
+def load_meta_map(resource_category, session):
+    config = RESOURCE_CATEGORY_CONFIG[resource_category]
+    return config['get_meta_map'](session) if 'get_meta_map' in config else None
+
+def process_row_files(row, config, output_dir, meta_map, resource_category, docs, para_types_set, span_types_set):
+    course_bag_id = config['get_course_bag_id'](row)
+    tag_names = config['get_tag_names'](row)
+    processed_dir = config['processed_dir'](output_dir, course_bag_id)
+    if not os.path.exists(processed_dir):
+        return
+    for fname in os.listdir(processed_dir):
+        pdf_filename_stem = ""
+        if fname.lower().endswith('_middle.json'):
+            file_stem = os.path.splitext(fname)[0]
+            pdf_filename_stem = file_stem.replace('_middle', '')
+            json_path = os.path.join(processed_dir, fname)
+            with open(json_path, "r", encoding="utf-8") as f:
+                try:
+                    data = json.load(f)
+                except Exception as e:
+                    print(f"Failed to load {json_path}: {e}")
+                    return
+            pdf_info = data.get("pdf_info", [])
+            meta = lookup_meta(meta_map, resource_category, course_bag_id, pdf_filename_stem)
+            if meta_map is not None and not meta:
+                print(f"Meta not found for ({course_bag_id}, {pdf_filename_stem}.pdf), skipping.")
+                return
+            for page in pdf_info:
+                process_page(page, meta, tag_names, docs, para_types_set, span_types_set)
+
+def lookup_meta(meta_map, resource_category, course_bag_id, pdf_filename_stem):
+    pdf_filename = f"{pdf_filename_stem}.pdf"
+    if resource_category == "lesson_plan":
+        return meta_map.get((course_bag_id, pdf_filename))
+    elif resource_category == "tm_textbook":
+        return meta_map.get((course_bag_id, pdf_filename))
+    return None
+
+def process_page(page, meta, tag_names, docs, para_types_set, span_types_set):
+    page_idx = page.get("page_idx")
+    para_blocks = page.get("para_blocks", [])
+    page_size = page.get("page_size", None)
+    for idx, para in enumerate(para_blocks):
+        para_type = para.get("type")
+        if para_type is not None:
+            para_types_set.add(para_type)
+        bbox = para.get("bbox")
+        merged_contents = extract_para_content(para, span_types_set)
+        if not merged_contents:
+            continue
+        content = "".join(merged_contents)
+        doc = construct_doc(meta, page_idx, idx, bbox, page_size, content, tag_names)
+        docs.append(doc)
+
+def extract_para_content(para, span_types_set):
+    merged_contents = []
+    if para.get("type") == "table":
+        blocks = para.get("blocks", [])
+        for block in blocks:
+            block_content = []
+            block_lines = block.get("lines", [])
+            for line in block_lines:
+                spans = line.get("spans", [])
+                if not spans:
+                    continue
+                for span in spans:
+                    span_type = span.get("type")
+                    if span_type is not None:
+                        span_types_set.add(span_type)
+                    if span.get("type") == "table":
+                        html = span.get("html", "")
+                        if html:
+                            block_content.append(html)
+            if block_content:
+                merged_contents.append("".join(block_content))
+    else:
+        lines = para.get("lines", [])
+        for line in lines:
+            spans = line.get("spans", [])
+            if not spans:
+                continue
+            line_content = []
+            for span in spans:
+                span_type = span.get("type")
+                if span_type is not None:
+                    span_types_set.add(span_type)
+                if span.get("type") == "text":
+                    line_content.append(span.get("content", ""))
+                elif span.get("type") == "inline_equation":
+                    line_content.append(f"${span.get('content', '')}$")
+                elif span.get("type") == "interline_equation":
+                    line_content.append(f"$$\n{span.get('content', '')}\n$$")
+                elif span.get("type") == "image":
+                    image_path = span.get("image_path", "")
+                    if image_path:
+                        line_content.append(f"[image]({image_path})")
+            if line_content:
+                merged_contents.append("".join(line_content))
+    return merged_contents
+
+def construct_doc(meta, page_idx, idx, bbox, page_size, content, tag_names):
+    if meta is not None:
+        doc_id = f"{meta.id}_{page_idx}_{idx}"
+        page_id = f"{meta.id}_{page_idx}"
+        doc = {
+            "doc_id": doc_id,
+            "page_id": page_id,
+            "id": meta.id,
+            "resource_type_code": getattr(meta, "resource_type_code", None),
+            "resource_type_code_name": getattr(meta, "resource_type_code_name", None),
+            "container_id": getattr(meta, "container_id", None),
+            "tag_list": getattr(meta, "tag_list", None),
+            "parent_id": getattr(meta, "course_bag_id", None) if hasattr(meta, "course_bag_id") else None,
+            "page_idx": page_idx,
+            "bbox": bbox,
+            "bbox_index": idx,
+            "page_size": page_size,
+            "text": content
+        }
+    else:
+        doc = {
+            "doc_id": doc_id,
+            "page_idx": page_idx,
+            "bbox": bbox,
+            "bbox_index": idx,
+            "page_size": page_size,
+            "text": content
+        }
+    if tag_names is not None:
+        doc["tag_names"] = tag_names
+    return doc
+
 def build_resource_ir_dataset_corpus(resource_category):
     output_dir = os.path.join(os.path.dirname(__file__), '../temp_output/smartcn')
     config = RESOURCE_CATEGORY_CONFIG[resource_category]
@@ -43,140 +175,15 @@ def build_resource_ir_dataset_corpus(resource_category):
     print(f"Using database at {db_path}")
     Session = init_db(db_path)
     session = Session()
-
-    # 通用 meta_map 获取
-    meta_map = config['get_meta_map'](session) if 'get_meta_map' in config else None
-
+    meta_map = load_meta_map(resource_category, session)
     rows = config['db_rows'](session)
     print(f"Found {len(rows)} resources for {resource_category}")
     docs = []
     para_types_set = set()
     span_types_set = set()
     for row in rows:
-        course_bag_id = config['get_course_bag_id'](row)
-        tag_names = config['get_tag_names'](row)
-        processed_dir = config['processed_dir'](output_dir, course_bag_id)
-        if not os.path.exists(processed_dir):
-            continue
-        for fname in os.listdir(processed_dir):
-            pdf_filename_stem = ""
-            if fname.lower().endswith('_middle.json'):
-                file_stem = os.path.splitext(fname)[0]
-                pdf_filename_stem = file_stem.replace('_middle', '')
-                json_path = os.path.join(processed_dir, fname)
-                with open(json_path, "r", encoding="utf-8") as f:
-                    try:
-                        data = json.load(f)
-                    except Exception as e:
-                        print(f"Failed to load {json_path}: {e}")
-                        continue
-                pdf_info = data.get("pdf_info", [])
-                # --- meta lookup ---
-                meta = None
-                if meta_map is not None:
-                    # lesson_plan: key = (course_bag_id, pdf_filename)
-                    # tm_textbook: key = (id, filename)
-                    if resource_category == "lesson_plan":
-                        pdf_filename = f"{pdf_filename_stem}.pdf"
-                        meta = meta_map.get((course_bag_id, pdf_filename))
-                    elif resource_category == "tm_textbook":
-                        pdf_filename = f"{pdf_filename_stem}.pdf"
-                        meta = meta_map.get((course_bag_id, pdf_filename))
-                    if not meta:
-                        print(f"Meta not found for ({course_bag_id}, {pdf_filename}), skipping.")
-                        continue
-                # --- end meta lookup ---
-                for page in pdf_info:
-                    page_idx = page.get("page_idx")
-                    para_blocks = page.get("para_blocks", [])
-                    page_size = page.get("page_size", None)
-                    for idx, para in enumerate(para_blocks):
-                        para_type = para.get("type")
-                        if para_type is not None:
-                            para_types_set.add(para_type)
-                        bbox = para.get("bbox")
-                        merged_contents = []
-                        if para.get("type") == "table":
-                            blocks = para.get("blocks", [])
-                            for block in blocks:
-                                block_content = []
-                                block_lines = block.get("lines", [])
-                                for line in block_lines:
-                                    spans = line.get("spans", [])
-                                    if not spans:
-                                        continue
-                                    for span in spans:
-                                        span_type = span.get("type")
-                                        if span_type is not None:
-                                            span_types_set.add(span_type)
-                                        if span.get("type") == "table":
-                                            html = span.get("html", "")
-                                            if html:
-                                                block_content.append(html)
-                                if block_content:
-                                    merged_contents.append("".join(block_content))
-                        else:
-                            lines = para.get("lines", [])
-                            for line in lines:
-                                spans = line.get("spans", [])
-                                if not spans:
-                                    continue
-                                line_content = []
-                                for span in spans:
-                                    span_type = span.get("type")
-                                    if span_type is not None:
-                                        span_types_set.add(span_type)
-                                    if span.get("type") == "text":
-                                        line_content.append(span.get("content", ""))
-                                    elif span.get("type") == "inline_equation":
-                                        line_content.append(f"${span.get('content', '')}$")
-                                    elif span.get("type") == "interline_equation":
-                                        line_content.append(f"$$\n{span.get('content', '')}\n$$")
-                                    elif span.get("type") == "image":
-                                        image_path = span.get("image_path", "")
-                                        if image_path:
-                                            line_content.append(f"[image]({image_path})")
-                                if line_content:
-                                    merged_contents.append("".join(line_content))
-                        if not merged_contents:
-                            continue
-                        content = "".join(merged_contents)
-                        # --- doc construction ---
-                        if meta is not None:
-                            # lesson_plan: meta 字段来自 LessonPlanResourceMeta
-                            # tm_textbook: meta 字段来自 TextbookTM
-                            doc_id = f"{meta.id}_{page_idx}_{idx}"
-                            page_id = f"{meta.id}_{page_idx}"
-                            doc = {
-                                "doc_id": doc_id,
-                                "page_id": page_id,
-                                "id": meta.id,
-                                "resource_type_code": getattr(meta, "resource_type_code", None),
-                                "resource_type_code_name": getattr(meta, "resource_type_code_name", None),
-                                "container_id": getattr(meta, "container_id", None),
-                                "tag_list": getattr(meta, "tag_list", None),
-                                "parent_id": getattr(meta, "course_bag_id", None) if hasattr(meta, "course_bag_id") else None,
-                                "page_idx": page_idx,
-                                "bbox": bbox,
-                                "bbox_index": idx,
-                                "page_size": page_size,
-                                "text": content
-                            }
-                        else:
-                            doc = {
-                                "doc_id": doc_id,
-                                "page_idx": page_idx,
-                                "bbox": bbox,
-                                "bbox_index": idx,
-                                "page_size": page_size,
-                                "text": content
-                            }
-                        if tag_names is not None:
-                            doc["tag_names"] = tag_names
-                        docs.append(doc)
-    # 打印 para_blocks 中 type 的种类
+        process_row_files(row, config, output_dir, meta_map, resource_category, docs, para_types_set, span_types_set)
     print("para_blocks type set:", para_types_set)
-    # 打印 span 中 type 的种类
     print("span type set:", span_types_set)
     session.close()
     out_path = os.path.join(ir_dataset_dir, "documents.jsonl")
