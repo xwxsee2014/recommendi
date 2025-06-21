@@ -85,40 +85,12 @@ class LessonPlanResourceMeta(Base):
 def init_db(db_path):
     engine = create_engine(f'sqlite:///{db_path}')
     Base.metadata.create_all(engine)
-    with engine.connect() as conn:
-        # 检查并添加 resource_type_code、tag_list、tag_names 字段
-        # resource_download_status
-        res = conn.execute(text("PRAGMA table_info(resource_download_status)")).fetchall()
-        columns = [r[1] for r in res]
-        if 'resource_type_code' not in columns:
-            conn.execute(text("ALTER TABLE resource_download_status ADD COLUMN resource_type_code TEXT"))
-        if 'tag_list' not in columns:
-            conn.execute(text("ALTER TABLE resource_download_status ADD COLUMN tag_list TEXT"))
-        if 'tag_names' not in columns:
-            conn.execute(text("ALTER TABLE resource_download_status ADD COLUMN tag_names TEXT"))
-        # textbook_tm
-        res = conn.execute(text("PRAGMA table_info(textbook_tm)")).fetchall()
-        columns = [r[1] for r in res]
-        if 'tag_list' not in columns:
-            conn.execute(text("ALTER TABLE textbook_tm ADD COLUMN tag_list TEXT"))
-        # 新增字段
-        if 'resource_type_code' not in columns:
-            conn.execute(text("ALTER TABLE textbook_tm ADD COLUMN resource_type_code TEXT"))
-        if 'resource_type_code_name' not in columns:
-            conn.execute(text("ALTER TABLE textbook_tm ADD COLUMN resource_type_code_name TEXT"))
-        if 'container_id' not in columns:
-            conn.execute(text("ALTER TABLE textbook_tm ADD COLUMN container_id TEXT"))
-        if 'filename' not in columns:
-            conn.execute(text("ALTER TABLE textbook_tm ADD COLUMN filename TEXT"))
-        if 'filename_code' not in columns:
-            conn.execute(text("ALTER TABLE textbook_tm ADD COLUMN filename_code TEXT"))
-        # lesson_plan_resource_meta
-        res = conn.execute(text("PRAGMA table_info(lesson_plan_resource_meta)")).fetchall()
-        columns = [r[1] for r in res]
-        if 'filename' not in columns:
-            conn.execute(text("ALTER TABLE lesson_plan_resource_meta ADD COLUMN filename TEXT"))
-        if 'filename_code' not in columns:
-            conn.execute(text("ALTER TABLE lesson_plan_resource_meta ADD COLUMN filename_code TEXT"))
+    # column update migration for sqlite
+    # with engine.connect() as conn:
+    #     res = conn.execute(text("PRAGMA table_info(resource_download_status)")).fetchall()
+    #     columns = [r[1] for r in res]
+    #     if 'resource_type_code' not in columns:
+    #         conn.execute(text("ALTER TABLE resource_download_status ADD COLUMN resource_type_code TEXT"))
     Session = sessionmaker(bind=engine)
     return Session
 
@@ -129,65 +101,6 @@ X_ND_AUTH = 'MAC id="7F938B205F876FC3A30551F3A49313836755C0D451C08FC17466435A155
 data_num_threshold = {
     "lesson_plan": 500
 }
-
-def process_textbook_tms():
-    # 读取所有 textbook_tm_*.json 文件
-    input_dir = os.path.join(os.path.dirname(__file__), '../temp_input/smartcn/textbook_tm')
-    json_files = glob.glob(os.path.join(input_dir, 'textbook_tm_*.json'))
-
-    all_items = []
-    for file in json_files:
-        with open(file, 'r', encoding='utf-8') as f:
-            items = json.load(f)
-            all_items.extend(items)
-
-    id_tag_names_pairs = []
-    for item in all_items:
-        if isinstance(item, dict) and 'id' in item and 'tag_list' in item:
-            id_ = item['id']
-            tag_list = item.get('tag_list', [])
-            tag_names = [tag.get('tag_name') for tag in tag_list if isinstance(tag, dict) and 'tag_name' in tag]
-            tag_names_str = ','.join(tag_names)
-            id_tag_names_pairs.append((id_, tag_names_str))
-
-    # 保存到sqlite
-    output_dir = os.path.join(os.path.dirname(__file__), '../temp_output/smartcn')
-    os.makedirs(output_dir, exist_ok=True)
-    db_path = os.path.join(output_dir, 'textbooks.db')
-    Session = init_db(db_path)
-    session = Session()
-
-    for id_, tag_names in id_tag_names_pairs:
-        session.merge(TextbookTM(id=id_, tag_names=tag_names))
-    session.commit()
-    session.close()
-
-def process_textbooks():
-    # 读取所有 info_parts_*.json 文件
-    input_dir = os.path.join(os.path.dirname(__file__), '../temp_input/smartcn/textbook')
-    json_files = glob.glob(os.path.join(input_dir, 'info_parts_*.json'))
-
-    all_items = []
-    for file in json_files:
-        with open(file, 'r', encoding='utf-8') as f:
-            items = json.load(f)
-            all_items.extend(items)
-
-    # 不再过滤 title 包含“统编版”的元素，直接提取所有有id和title的
-    id_title_pairs = [(item['id'], item['title']) for item in all_items if isinstance(item, dict) and 'id' in item and 'title' in item]
-
-    # 保存到sqlite
-    output_dir = os.path.join(os.path.dirname(__file__), '../temp_output/smartcn')
-    os.makedirs(output_dir, exist_ok=True)
-    db_path = os.path.join(output_dir, 'textbooks.db')
-    Session = init_db(db_path)
-    session = Session()
-
-    # 6. 插入数据
-    for id_, title in id_title_pairs:
-        session.merge(Textbook(id=id_, title=title))
-    session.commit()
-    session.close()
 
 def detail_download_pre_check(course_bag_id, session, check_types):
     """
@@ -208,111 +121,91 @@ def detail_download_pre_check(course_bag_id, session, check_types):
     skip_download = all(skip_map.values())
     return skip_download, skip_map
 
-def process_lesson_plan_detail(detail_json, course_bag_id, textbook_id, session, skip_map=None):
-    if skip_map is not None and skip_map.get("lesson_plan", False):
-        print(f"The lesson plan for {course_bag_id} has already been processed, skipping...")
-        return
-    # relations下所有list类型value平铺为resource_list
-    print(f"Fetched lesson plan detail for {course_bag_id}")
+def extract_resource_list_from_detail_json(detail_json):
+    """
+    从 detail_json 的 relations 字段提取所有资源，平铺为 resource_list。
+    """
     relations = detail_json.get('relations', {})
     resource_list = []
     for v in relations.values():
         if isinstance(v, list):
             resource_list.extend(v)
-    # 直接从 detail_json 获取 tag_list 和 tag_names
-    tag_list_json = json.dumps(detail_json.get('tag_list', []), ensure_ascii=False)
-    tag_names_str = ','.join([tag.get('tag_name') for tag in detail_json.get('tag_list', []) if isinstance(tag, dict) and 'tag_name' in tag])
-    # 遍历 resource_list，找所有tag_list包含"教学设计"的资源
-    headers = {
-        "x-nd-auth": X_ND_AUTH
-    }
-    resource_tags = []
-    lesson_plan_downloaded_count = 0
-    pdf_index = 1  # 用于命名pdf文件的序号
-    has_jiaoxuesheji_tag = False
-    for res in resource_list:
-        tag_list = res.get('tag_list', [])
-        # 收集所有tag_name
-        for tag in tag_list:
-            tag_name = tag.get('tag_name')
-            if tag_name:
-                resource_tags.append(tag_name)
-        # 判断是否有tag_name为"教学设计"
-        has_jiaoxuesheji = any(tag.get('tag_name') == '教学设计' for tag in tag_list)
-        if has_jiaoxuesheji:
-            has_jiaoxuesheji_tag = True
-            ti_items = res.get('ti_items', [])
-            for ti_item in ti_items:
-                if ti_item.get('ti_file_flag') == 'pdf' or ti_item.get('ti_format') == 'pdf':
-                    ti_storages = ti_item.get('ti_storages', [])
-                    for storage in ti_storages:
-                        if isinstance(storage, str):
-                            # 处理字符串类型的storage
-                            pdf_url = storage
-                        elif isinstance(storage, dict):
-                            # 处理字典类型的storage
-                            if 'url' in storage:
-                                pdf_url = storage['url']
-                            else:
-                                continue
-                        else:
-                            continue
-                        if not pdf_url:
-                            continue
-                        out_dir = os.path.join(os.path.dirname(__file__), f'../temp_output/smartcn/downloads/{course_bag_id}/lesson_plan')
-                        os.makedirs(out_dir, exist_ok=True)
-                        orig_filename = os.path.basename(pdf_url.split('?')[0])
-                        filename = f"{pdf_index:03d}_{orig_filename}"
-                        # 生成 filename_code
-                        file_stem = os.path.splitext(filename)[0]
-                        middle_file_stem = file_stem + '_middle'
-                        if not all(c.isalnum() or c in "_-" for c in file_stem):
-                            filename_code = hashlib.md5(middle_file_stem.encode("utf-8")).hexdigest()
-                        else:
-                            filename_code = middle_file_stem
-                        out_path = os.path.join(out_dir, filename)
-                        try:
-                            time.sleep(1)
-                            resp = requests.get(pdf_url, timeout=15, headers=headers)
-                            if resp.status_code == 401 or resp.status_code == 403:
-                                raise RuntimeError("x-nd-auth header expired or invalid, please update it and retry.")
-                            if resp.status_code == 200:
-                                with open(out_path, 'wb') as f:
-                                    f.write(resp.content)
-                                print(f"Downloaded PDF: {out_path}")
-                                lesson_plan_downloaded_count += 1
-                                # --- 新增：同步插入 LessonPlanResourceMeta ---
-                                meta_id = res.get('id')
-                                container_id = res.get('container_id')
-                                lesson_plan_resource_type_code = res.get('resource_type_code', '')
-                                resource_type_code_name = res.get('resource_type_code_name', '')
-                                tag_list_json_res = json.dumps(tag_list, ensure_ascii=False)
-                                session.merge(LessonPlanResourceMeta(
-                                    id=meta_id,
-                                    resource_type_code=lesson_plan_resource_type_code,
-                                    resource_type_code_name=resource_type_code_name,
-                                    container_id=container_id,
-                                    tag_list=tag_list_json_res,
-                                    course_bag_id=course_bag_id,
-                                    filename=filename,
-                                    filename_code=filename_code
-                                ))
-                                session.commit()
-                                # --- 新增结束 ---
-                                pdf_index += 1
-                                break  # 当前ti_item只下载一个pdf
-                        except Exception as e:
-                            print(f"Failed to download PDF from {pdf_url}: {e}")
-                    # 不break，继续下一个ti_item
-    print(f"Resource tag names found: {', '.join(set(resource_tags))}")
-    # 若没有"教学设计"tag，插入no_lesson_plan_resource表
-    if not has_jiaoxuesheji_tag:
-        if not session.query(NoLessonPlanResource).filter_by(course_bag_id=course_bag_id).first():
-            session.add(NoLessonPlanResource(course_bag_id=course_bag_id))
-            session.commit()
-        print(f"该资源没有lesson plan，skipping: {course_bag_id}")
-        return
-    # 更新数据库
+    return resource_list
+
+def download_lesson_plan_pdf(res, course_bag_id, pdf_index, headers, session):
+    """
+    下载教学设计 PDF，插入 LessonPlanResourceMeta，返回 (是否下载, 文件名, 文件名编码)
+    """
+    import hashlib
+    import time
+    import os
+    pdf_downloaded = False
+    filename = None
+    filename_code = None
+    tag_list = res.get('tag_list', [])
+    ti_items = res.get('ti_items', [])
+    for ti_item in ti_items:
+        if ti_item.get('ti_file_flag') == 'pdf' or ti_item.get('ti_format') == 'pdf':
+            ti_storages = ti_item.get('ti_storages', [])
+            for storage in ti_storages:
+                if isinstance(storage, str):
+                    pdf_url = storage
+                elif isinstance(storage, dict):
+                    pdf_url = storage.get('url')
+                else:
+                    continue
+                if not pdf_url:
+                    continue
+                out_dir = os.path.join(os.path.dirname(__file__), f'../temp_output/smartcn/downloads/{course_bag_id}/lesson_plan')
+                os.makedirs(out_dir, exist_ok=True)
+                orig_filename = os.path.basename(pdf_url.split('?')[0])
+                filename = f"{pdf_index:03d}_{orig_filename}"
+                file_stem = os.path.splitext(filename)[0]
+                middle_file_stem = file_stem + '_middle'
+                if not all(c.isalnum() or c in "_-" for c in file_stem):
+                    filename_code = hashlib.md5(middle_file_stem.encode("utf-8")).hexdigest()
+                else:
+                    filename_code = middle_file_stem
+                out_path = os.path.join(out_dir, filename)
+                try:
+                    time.sleep(1)
+                    resp = requests.get(pdf_url, timeout=15, headers=headers)
+                    if resp.status_code == 401 or resp.status_code == 403:
+                        raise RuntimeError("x-nd-auth header expired or invalid, please update it and retry.")
+                    if resp.status_code == 200:
+                        with open(out_path, 'wb') as f:
+                            f.write(resp.content)
+                        print(f"Downloaded PDF: {out_path}")
+                        pdf_downloaded = True
+                        # 插入 LessonPlanResourceMeta
+                        meta_id = res.get('id')
+                        container_id = res.get('container_id')
+                        lesson_plan_resource_type_code = res.get('resource_type_code', '')
+                        resource_type_code_name = res.get('resource_type_code_name', '')
+                        tag_list_json_res = json.dumps(tag_list, ensure_ascii=False)
+                        session.merge(LessonPlanResourceMeta(
+                            id=meta_id,
+                            resource_type_code=lesson_plan_resource_type_code,
+                            resource_type_code_name=resource_type_code_name,
+                            container_id=container_id,
+                            tag_list=tag_list_json_res,
+                            course_bag_id=course_bag_id,
+                            filename=filename,
+                            filename_code=filename_code
+                        ))
+                        session.commit()
+                        return True, filename, filename_code
+                except Exception as e:
+                    print(f"Failed to download PDF from {pdf_url}: {e}")
+            # 只下载一个 pdf
+            if pdf_downloaded:
+                break
+    return False, filename, filename_code
+
+def update_lesson_plan_db(session, textbook_id, course_bag_id, lesson_plan_downloaded_count, detail_json, tag_list_json, tag_names_str):
+    """
+    更新 Textbook, ResourceDownloadStatus 表
+    """
     if lesson_plan_downloaded_count > 0:
         tb = session.query(Textbook).filter(Textbook.id == textbook_id).first()
         if tb:
@@ -341,6 +234,43 @@ def process_lesson_plan_detail(detail_json, course_bag_id, textbook_id, session,
             print(f"已达到lesson_plan资源数量上限: {data_num_threshold['lesson_plan']}，程序终止。")
             session.close()
             exit(0)
+
+def process_lesson_plan_detail(detail_json, course_bag_id, textbook_id, session, skip_map=None):
+    if skip_map is not None and skip_map.get("lesson_plan", False):
+        print(f"The lesson plan for {course_bag_id} has already been processed, skipping...")
+        return
+    print(f"Fetched lesson plan detail for {course_bag_id}")
+    resource_list = extract_resource_list_from_detail_json(detail_json)
+    tag_list_json = json.dumps(detail_json.get('tag_list', []), ensure_ascii=False)
+    tag_names_str = ','.join([tag.get('tag_name') for tag in detail_json.get('tag_list', []) if isinstance(tag, dict) and 'tag_name' in tag])
+    headers = {
+        "x-nd-auth": X_ND_AUTH
+    }
+    resource_tags = []
+    lesson_plan_downloaded_count = 0
+    pdf_index = 1
+    has_jiaoxuesheji_tag = False
+    for res in resource_list:
+        tag_list = res.get('tag_list', [])
+        for tag in tag_list:
+            tag_name = tag.get('tag_name')
+            if tag_name:
+                resource_tags.append(tag_name)
+        has_jiaoxuesheji = any(tag.get('tag_name') == '教学设计' for tag in tag_list)
+        if has_jiaoxuesheji:
+            has_jiaoxuesheji_tag = True
+            downloaded, _, _ = download_lesson_plan_pdf(res, course_bag_id, pdf_index, headers, session)
+            if downloaded:
+                lesson_plan_downloaded_count += 1
+                pdf_index += 1
+    print(f"Resource tag names found: {', '.join(set(resource_tags))}")
+    if not has_jiaoxuesheji_tag:
+        if not session.query(NoLessonPlanResource).filter_by(course_bag_id=course_bag_id).first():
+            session.add(NoLessonPlanResource(course_bag_id=course_bag_id))
+            session.commit()
+        print(f"该资源没有lesson plan，skipping: {course_bag_id}")
+        return
+    update_lesson_plan_db(session, textbook_id, course_bag_id, lesson_plan_downloaded_count, detail_json, tag_list_json, tag_names_str)
 
 def fetch_lesson_plan_resources_for_random_subjects():
     output_dir = os.path.join(os.path.dirname(__file__), '../temp_output/smartcn')
@@ -446,61 +376,6 @@ def fetch_lesson_plan_resources_for_random_subjects():
 
     session.close()
 
-def update_lesson_plan_downloaded_status():
-    from collections import defaultdict
-    downloads_dir = os.path.join(os.path.dirname(__file__), '../temp_output/smartcn/downloads')
-    output_dir = os.path.join(os.path.dirname(__file__), '../temp_output/smartcn')
-    db_path = os.path.join(output_dir, 'textbooks.db')
-    Session = init_db(db_path)
-    session = Session()
-
-    # 1. 遍历downloads下所有子目录，统计每个course_bag_id下pdf数量
-    course_bag_pdf_count = {}
-    if os.path.exists(downloads_dir):
-        for course_bag_id in os.listdir(downloads_dir):
-            subdir = os.path.join(downloads_dir, course_bag_id)
-            if os.path.isdir(subdir):
-                pdf_count = 0
-                for root, _, files in os.walk(subdir):
-                    for file in files:
-                        if file.lower().endswith('.pdf'):
-                            pdf_count += 1
-                course_bag_pdf_count[course_bag_id] = pdf_count
-
-    # 2. 更新ResourceDownloadStatus表
-    all_status = session.query(ResourceDownloadStatus).all()
-    updated_ids = set()
-    for status in all_status:
-        cbid = status.course_bag_id
-        if cbid in course_bag_pdf_count:
-            status.lesson_plan = course_bag_pdf_count[cbid]
-            updated_ids.add(cbid)
-        else:
-            status.lesson_plan = 0
-    session.commit()
-
-    # 3. 输出每个course_bag_id的pdf数量
-    for cbid, count in course_bag_pdf_count.items():
-        print(f"{cbid}: {count} PDFs")
-
-    # 4. 统计ResourceDownloadStatus中lesson_plan的总和
-    total = session.query(func.sum(ResourceDownloadStatus.lesson_plan)).scalar() or 0
-    print(f"Total lesson plan PDFs recorded in DB: {total}")
-
-    # 5. 按textbook_id分组统计lesson_plan数量，并更新Textbook表
-    textbook_lesson_plan = session.query(
-        ResourceDownloadStatus.textbook_id,
-        func.sum(ResourceDownloadStatus.lesson_plan)
-    ).group_by(ResourceDownloadStatus.textbook_id).all()
-    for textbook_id, lesson_plan_num in textbook_lesson_plan:
-        if textbook_id:
-            tb = session.query(Textbook).filter(Textbook.id == textbook_id).first()
-            if tb:
-                tb.downloaded_lesson_plan_num = lesson_plan_num or 0
-    session.commit()
-
-    session.close()
-    return total
 
 def fetch_textbook_tm_resources():
     """
@@ -609,277 +484,7 @@ def fetch_textbook_tm_resources():
 
     session.close()
 
-def supplement_resource_download_status_fields():
-    """
-    补充 ResourceDownloadStatus 表中的 resource_type_code、tag_list、tag_names 字段。
-    只处理 lesson_plan > 0 且 resource_type_code 为空的记录。
-    """
-    output_dir = os.path.join(os.path.dirname(__file__), '../temp_output/smartcn')
-    db_path = os.path.join(output_dir, 'textbooks.db')
-    Session = init_db(db_path)
-    session = Session()
-
-    rows = session.query(ResourceDownloadStatus).filter(
-        ResourceDownloadStatus.lesson_plan > 0, 
-        (ResourceDownloadStatus.resource_type_code == None) | (ResourceDownloadStatus.resource_type_code == '')
-    ).all()
-
-    total = len(rows)
-    for idx, row in enumerate(rows, 1):
-        print(f"[{idx}/{total}] Processing course_bag_id: {row.course_bag_id}")
-        course_bag_id = row.course_bag_id
-        detail_json = None
-        resource_type_code = None
-        url_types = [
-            ('elite_lesson', [
-                f"https://s-file-1.ykt.cbern.com.cn/zxx/ndrv2/resources/{course_bag_id}.json",
-                f"https://s-file-2.ykt.cbern.com.cn/zxx/ndrv2/resources/{course_bag_id}.json"
-            ]),
-            ('national_lesson', [
-                f"https://s-file-1.ykt.cbern.com.cn/zxx/ndrv2/national_lesson/resources/details/{course_bag_id}.json",
-                f"https://s-file-2.ykt.cbern.com.cn/zxx/ndrv2/national_lesson/resources/details/{course_bag_id}.json"
-            ]),
-            ('prepare_lesson', [
-                f"https://s-file-1.ykt.cbern.com.cn/zxx/ndrv2/prepare_lesson/resources/details/{course_bag_id}.json",
-                f"https://s-file-2.ykt.cbern.com.cn/zxx/ndrv2/prepare_lesson/resources/details/{course_bag_id}.json"
-            ])
-        ]
-        for rtype, urls in url_types:
-            for url in urls:
-                try:
-                    time.sleep(1)
-                    resp = requests.get(url, timeout=10, headers={"x-nd-auth": X_ND_AUTH})
-                    if resp.status_code == 200:
-                        detail_json = resp.json()
-                        resource_type_code = detail_json.get('resource_type_code', rtype)
-                        break
-                except Exception:
-                    continue
-            if detail_json:
-                break
-        if not detail_json:
-            print(f"Failed to fetch detail_json for {course_bag_id}")
-            continue
-
-        tag_list_json = json.dumps(detail_json.get('tag_list', []), ensure_ascii=False)
-        tag_names_str = ','.join([tag.get('tag_name') for tag in detail_json.get('tag_list', []) if isinstance(tag, dict) and 'tag_name' in tag])
-
-        row.resource_type_code = resource_type_code
-        row.tag_list = tag_list_json
-        row.tag_names = tag_names_str
-        session.commit()
-
-    session.close()
-
-def supplement_lesson_plan_resource_meta():
-    """
-    从 ResourceDownloadStatus 获取 lesson_plan > 0 且 resource_type_code 不为空的数据，
-    且过滤掉 LessonPlanResourceMeta 表中已存在相同 course_bag_id 的数据。
-    遍历后按 resource_type_code 获取 detail_json，提取教学设计资源，存入 LessonPlanResourceMeta。
-    """
-    output_dir = os.path.join(os.path.dirname(__file__), '../temp_output/smartcn')
-    db_path = os.path.join(output_dir, 'textbooks.db')
-    Session = init_db(db_path)
-    session = Session()
-
-    # 获取已存在的 course_bag_id
-    existing_cbag_ids = set(
-        row.course_bag_id for row in session.query(LessonPlanResourceMeta.course_bag_id).all()
-    )
-
-    # 获取 ResourceDownloadStatus 需要处理的行
-    rows = session.query(ResourceDownloadStatus).filter(
-        ResourceDownloadStatus.lesson_plan > 0,
-        ResourceDownloadStatus.resource_type_code != None,
-        ResourceDownloadStatus.resource_type_code != ''
-    ).all()
-
-    # 过滤掉已存在的
-    filtered_rows = [row for row in rows if row.course_bag_id not in existing_cbag_ids]
-    total = len(filtered_rows)
-    for idx, row in enumerate(filtered_rows, 1):
-        print(f"[{idx}/{total}] Processing course_bag_id: {row.course_bag_id}")
-        course_bag_id = row.course_bag_id
-        resource_type_code = row.resource_type_code
-        urls = []
-        if resource_type_code == 'elite_lesson':
-            urls = [
-                f"https://s-file-1.ykt.cbern.com.cn/zxx/ndrv2/resources/{course_bag_id}.json",
-                f"https://s-file-2.ykt.cbern.com.cn/zxx/ndrv2/resources/{course_bag_id}.json"
-            ]
-        elif resource_type_code == 'national_lesson':
-            urls = [
-                f"https://s-file-1.ykt.cbern.com.cn/zxx/ndrv2/national_lesson/resources/details/{course_bag_id}.json",
-                f"https://s-file-2.ykt.cbern.com.cn/zxx/ndrv2/national_lesson/resources/details/{course_bag_id}.json"
-            ]
-        elif resource_type_code == 'prepare_lesson':
-            urls = [
-                f"https://s-file-1.ykt.cbern.com.cn/zxx/ndrv2/prepare_lesson/resources/details/{course_bag_id}.json",
-                f"https://s-file-2.ykt.cbern.com.cn/zxx/ndrv2/prepare_lesson/resources/details/{course_bag_id}.json"
-            ]
-        else:
-            print(f"Unsupported resource_type_code: {resource_type_code} for course_bag_id: {course_bag_id}")
-            continue
-
-        detail_json = None
-        for url in urls:
-            try:
-                time.sleep(1)
-                resp = requests.get(url, timeout=10, headers={"x-nd-auth": X_ND_AUTH})
-                if resp.status_code == 200:
-                    detail_json = resp.json()
-                    break
-            except Exception:
-                continue
-        if not detail_json:
-            print(f"Failed to fetch detail_json for {course_bag_id}")
-            continue
-
-        # 提取教学设计资源
-        relations = detail_json.get('relations', {})
-        resource_list = []
-        for v in relations.values():
-            if isinstance(v, list):
-                resource_list.extend(v)
-        found = False
-        pdf_index = 1  # 新增：用于文件名编号
-        for res in resource_list:
-            tag_list = res.get('tag_list', [])
-            has_jiaoxuesheji = any(tag.get('tag_name') == '教学设计' for tag in tag_list)
-            if has_jiaoxuesheji:
-                found = True
-                meta_id = res.get('id')
-                container_id = res.get('container_id')
-                tag_list_json = json.dumps(tag_list, ensure_ascii=False)
-                lesson_plan_resource_type_code = res.get('resource_type_code', resource_type_code)
-                resource_type_code_name = res.get('resource_type_code_name', '')
-                # 处理 filename，参考 process_lesson_plan_detail
-                filename = None
-                ti_items = res.get('ti_items', [])
-                for ti_item in ti_items:
-                    if ti_item.get('ti_file_flag') == 'pdf' or ti_item.get('ti_format') == 'pdf':
-                        ti_storages = ti_item.get('ti_storages', [])
-                        for storage in ti_storages:
-                            if isinstance(storage, str):
-                                pdf_url = storage
-                            elif isinstance(storage, dict):
-                                pdf_url = storage.get('url')
-                            else:
-                                continue
-                            if not pdf_url:
-                                continue
-                            orig_filename = os.path.basename(pdf_url.split('?')[0])
-                            filename = f"{pdf_index:03d}_{orig_filename}"  # 加上编号
-                            # 新增 filename_code 生成逻辑
-                            file_stem = os.path.splitext(filename)[0]
-                            middle_file_stem = file_stem + '_middle'
-                            if not all(c.isalnum() or c in "_-" for c in file_stem):
-                                filename_code = hashlib.md5(middle_file_stem.encode("utf-8")).hexdigest()
-                            else:
-                                filename_code = middle_file_stem
-                            print(f"pdf_index: {pdf_index}, filename: {filename}, filename_code: {filename_code}")
-                            pdf_index += 1
-                            # 插入 LessonPlanResourceMeta
-                            session.merge(LessonPlanResourceMeta(
-                                id=meta_id,
-                                resource_type_code=lesson_plan_resource_type_code,
-                                resource_type_code_name=resource_type_code_name,
-                                container_id=container_id,
-                                tag_list=tag_list_json,
-                                course_bag_id=course_bag_id,
-                                filename=filename,
-                                filename_code=filename_code
-                            ))
-                            break
-                        break # 当前 ti_item 只下载一个 pdf
-        if found:
-            session.commit()
-        else:
-            print(f"No 教学设计 resource found for {course_bag_id}")
-
-    session.close()
-
-def supplement_textbook_tm_fields():
-    """
-    补充 TextbookTM 表中的 resource_type_code、resource_type_code_name、container_id、filename 字段。
-    只处理 processed > 0 且 resource_type_code 为空的记录。
-    """
-    output_dir = os.path.join(os.path.dirname(__file__), '../temp_output/smartcn')
-    db_path = os.path.join(output_dir, 'textbooks.db')
-    Session = init_db(db_path)
-    session = Session()
-
-    rows = session.query(TextbookTM).filter(
-        TextbookTM.processed > 0,
-        # (TextbookTM.resource_type_code == None) | (TextbookTM.resource_type_code == '')
-    ).all()
-
-    total = len(rows)
-    for idx, row in enumerate(rows, 1):
-        print(f"[{idx}/{total}] Processing textbook_tm_id: {row.id}")
-        textbook_tm_id = row.id
-        detail_url = f"https://s-file-2.ykt.cbern.com.cn/zxx/ndrv2/resources/tch_material/details/{textbook_tm_id}.json"
-        detail_json = None
-        try:
-            time.sleep(1)
-            resp = requests.get(detail_url, timeout=15)
-            if resp.status_code == 200:
-                detail_json = resp.json()
-            else:
-                print(f"Failed to fetch detail for {textbook_tm_id}: status_code={resp.status_code}")
-                continue
-        except Exception as e:
-            print(f"Failed to fetch detail for {textbook_tm_id}: {e}")
-            continue
-
-        # 获取 resource_type_code
-        resource_type_code = detail_json.get('resource_type_code')
-        resource_type_code_name = detail_json.get('resource_type_code_name')
-        container_id = detail_json.get('container_id')
-        tag_list = detail_json.get('tag_list', [])
-        tag_list_json = json.dumps(tag_list, ensure_ascii=False)
-        filename = None
-        filename_code = None
-        ti_items = detail_json.get('ti_items', [])
-        pdf_index = 1
-        for ti_item in ti_items:
-            if ti_item.get('ti_format') == 'pdf':
-                ti_storages = ti_item.get('ti_storages', [])
-                for storage in ti_storages:
-                    pdf_url = storage if isinstance(storage, str) else storage.get('url') if isinstance(storage, dict) else None
-                    if not pdf_url:
-                        continue
-                    orig_filename = os.path.basename(pdf_url.split('?')[0])
-                    filename = f"{pdf_index:03d}_{orig_filename}"
-                    # 新增 filename_code 生成逻辑
-                    file_stem = os.path.splitext(filename)[0]
-                    middle_file_stem = file_stem + '_middle'
-                    if not all(c.isalnum() or c in "_-" for c in file_stem):
-                        filename_code = hashlib.md5(middle_file_stem.encode("utf-8")).hexdigest()
-                    else:
-                        filename_code = middle_file_stem
-                    break
-                if filename:
-                    break
-
-        # 更新字段
-        row.resource_type_code = resource_type_code
-        row.resource_type_code_name = resource_type_code_name
-        row.container_id = container_id
-        row.filename = filename
-        row.filename_code = filename_code  # 新增
-        row.tag_list = tag_list_json
-        session.commit()
-
-    session.close()
-
-
 if __name__ == "__main__":
-    # process_textbooks()
-    # fetch_lesson_plan_resources_for_random_subjects()
-    # update_lesson_plan_downloaded_status()
-    # process_textbook_tms()
+    fetch_lesson_plan_resources_for_random_subjects()
     # fetch_textbook_tm_resources()
-    # supplement_resource_download_status_fields()
-    supplement_lesson_plan_resource_meta()
-    supplement_textbook_tm_fields()
+    pass
